@@ -1,0 +1,2350 @@
+/* ═══════════════════════════════════════════════════════════════════════════
+   QX SMARTBOT v1.2 — Auto-Trading Assistant for QUOTEX (OTC markets)
+   ═══════════════════════════════════════════════════════════════════════════
+   HOW TO USE (DEMO FIRST!)
+     1) Open https://quotex.io or https://qxbroker.com and log in
+     2) Switch balance to DEMO account (top-right)
+     3) Press F12 -> Console -> type: allow pasting   (Chrome, first time)
+     4) Paste this ENTIRE file into Console -> Enter
+     5) Small dark panel appears top-right -> click "SELF-TEST" first:
+        every check should show PASS
+     6) Click START. The bot will:
+          - scan OTC markets and read live payout %
+          - ONLY trade markets with payout >= 85 (you can change it)
+          - if payout drops below your limit it skips and rotates
+            automatically to the next qualified market
+          - analyze with Smart Confluence strategy and place
+            CALL/PUT orders (Auto: WebSocket API first, buttons fallback)
+
+   STRATEGY  Smart Confluence = weighted vote of
+     RSI(14) + Bollinger(20,2) + EMA(3/9) + Stochastic(14,3)
+     + 3-candle reversal + MACD(12,26,9)
+     Trade fires only when enough signals agree (score threshold 0.45).
+     Other strategies (RSI / BB / EMA / Stoch / Candle) are inside too —
+     pick any of them from the panel dropdown.
+
+   MONEY MANAGEMENT (choose in panel)
+     FLAT  — same amount every trade
+     MTG1  — after a loss: x2 once, then reset  (1 → 2 → 1)
+     MTG2  — after a loss: x2, then x4, then reset (1 → 2 → 4 → 1)
+
+   RISK GUARD (Standard)
+     - auto-STOP at -15% of session balance or +15% profit
+     - pause 60s after 3 losses in a row, hard stop after 6
+     - 8s cooldown between trades, rotate market every 3 trades
+     - frozen-market detection (no tick movement -> skip market)
+
+   CONSOLE COMMANDS:  QXBOT.start()  QXBOT.stop()  QXBOT.selfTest()
+                      QXBOT.status()  QXBOT.destroy()
+                      QXBOT.scanMarkets() — force a payout scan right now
+                      QXBOT.pickAsset()   — teach me the asset button (20s)
+                      QXBOT.debug()       — dump diagnostics to console
+
+   v1.1 CHANGES (live-page fixes)
+     - asset button: 3-tier text/shape auto-detect + teachable selector
+     - payout DB: 3 sources — WS stream deep-harvester, asset-list DOM
+       rows, passive MutationObserver (reads rows when YOU open the list)
+     - SELF-TEST auto-scans the page and retries up to ~4s before failing
+     - socket.io 42[...]/451-[...] array frames now parsed too
+
+   v1.2 CHANGES (payout fix)
+     - BINARY WebSocket frames now decoded (QUOTEX sends price streams and
+       asset/payout updates as socket.io binary events: text frame
+       451-["event",{"_placeholder":true}] + binary attachment). This was
+       why payout DB stayed empty while "live frames" passed.
+     - fetch/XHR tap: payouts from REST responses are harvested too
+     - QXBOT.debug(): dumps socket state, last in/out frames, payout
+       candidates and DB stats to console for exact diagnosis
+     - decimal payouts (87.5%) parsed correctly
+     - SELF-TEST prints diagnostics when payout DB is empty
+
+   v1.3 CHANGES (headless mode — works even with NO asset button)
+     - HEADLESS TRADING: if the asset button cannot be found, the bot no
+       longer stalls. It trades the market ALREADY ON SCREEN via the
+       WebSocket openOrder API (no DOM click needed) as long as that
+       market pays ≥ your payout limit.
+     - payout harvest v3: whole-page sweep incl. SHADOW DOM + same-origin
+       iframes, sibling-node pairing (asset name and % may live in
+       different DOM nodes), row containers with up to 8 children
+     - current-market seeding: the on-screen chip ("EUR/USD (OTC) 92%")
+       feeds the payout DB automatically, even without opening the list
+     - warning spam removed (repeated messages throttled to once/min)
+     - pickAsset window 10s → 20s + verifies the learned button works
+
+   ⚠ DISCLAIMER: Binary options and martingale recovery are HIGH RISK.
+   This tool is for education and DEMO testing. Automation can violate
+   the broker's Terms of Service — your account is your responsibility.
+   No strategy can guarantee profit. Never trade money you cannot lose.
+   ═══════════════════════════════════════════════════════════════════════ */
+(function () {
+  'use strict';
+
+  /* Re-paste safety: clean previous instance */
+  if (globalThis.QXBOT && typeof globalThis.QXBOT.destroy === 'function') {
+    try { globalThis.QXBOT.destroy('re-paste'); } catch (e) { /* noop */ }
+  }
+
+  const VERSION = '1.3.0';
+
+  /* ── CONFIG ─────────────────────────────────────────────────────────── */
+  const CFG = {
+    strategy: 'smart',          // smart | rsi | bb | ema | stoch | candle | macd
+    tf: 30,                     // candle timeframe seconds: 5 | 15 | 30 | 60
+    expiry: 30,                 // trade duration seconds: 5 | 15 | 30 | 60
+    amount: 1,                  // base trade amount
+    mtg: 'none',                // none | mtg1 | mtg2
+    payoutMin: 85,              // minimum payout % to trade a market
+    cooldownSec: 8,             // wait between trades
+    pauseAfterStreak: 3,        // losses in a row -> pause
+    pauseSec: 60,               // pause length after streak
+    stopStreak: 6,              // losses in a row -> full stop
+    stopLossPct: 15,            // session stop-loss %
+    takeProfitPct: 15,          // session take-profit %
+    tradesPerMarket: 3,         // rotate market after N trades
+    minCandles: 20,             // min closed candles before signal
+    minTicks: 30,               // min buffered ticks before signal
+    warmTimeoutSec: 22,         // max wait for market data
+    frozenTicks: 12,            // equal ticks in a row = frozen market
+    smartThreshold: 0.45,       // confluence score needed to fire
+    scanRetrySec: 8,            // retry DOM payout scan every N sec
+    onlyOTC: true               // trade OTC markets only
+  };
+
+  /* ── UTILS ──────────────────────────────────────────────────────────── */
+  const Util = {
+    clamp(v, a, b) { return v < a ? a : v > b ? b : v; },
+    round2(v) { return Math.round(v * 100) / 100; },
+    now() { return Math.floor(Date.now() / 1000); },
+    sleep(ms) { return new Promise(r => setTimeout(r, ms)); },
+    norm(name) { return String(name || '').replace(/[^a-z0-9]/gi, '').toUpperCase(); },
+    /* extract payout % from text; handles "92%", "+87%", "87.5%" — null if not a valid payout */
+    pct(txt) {
+      const m = String(txt || '').match(/(\d{1,3}(?:[.,]\d+)?)\s*%/);
+      if (!m) return null;
+      const v = parseFloat(m[1].replace(',', '.'));
+      return v >= 5 && v <= 100 ? v : null;
+    },
+    /* symbol-like name? rejects UI labels (Payout, Currencies, Open…) */
+    isAssetName(s) {
+      if (!s) return false;
+      const t = String(s).trim();
+      if (t.length < 3 || t.length > 24) return false;
+      if (!/^[A-Z0-9][A-Z0-9/_\- ()]*$/i.test(t)) return false;
+      if (!/[A-Za-z]{3}/.test(t)) return false;
+      if (/[.,!?:;"'`]/.test(t)) return false;
+      return !/(payout|profit|balance|bonus|account|market|asset|search|popul|favorit|currenc|crypto|commodit|stock|indice|trad|deposit|withdraw|select|open|clos|demo|real|profile|setting|refer|help|chart|time|amount|invest|top|weekend|holiday|session|tourname|strateg|indicator|signal|history|feed|news|economic|calendar)/i.test(t);
+    },
+    cssPath(el) {
+      const parts = [];
+      let e = el;
+      while (e && e.nodeType === 1 && e.tagName !== 'BODY' && e.id !== 'qxbot-root') {
+        if (e.id && e.id !== 'qxbot-root') { parts.unshift('#' + e.id); break; }
+        let s = e.tagName.toLowerCase();
+        const p = e.parentElement;
+        if (p) {
+          const same = Array.prototype.filter.call(p.children, c => c.tagName === e.tagName);
+          if (same.length > 1) s += ':nth-of-type(' + (same.indexOf(e) + 1) + ')';
+        }
+        parts.unshift(s);
+        e = e.parentElement;
+      }
+      return parts.join('>');
+    },
+    /* real click sequence: mousedown→mouseup→click (pointer events too) */
+    fireClick(el) {
+      try {
+        const opts = { bubbles: true, cancelable: true, view: window, button: 0 };
+        if (typeof PointerEvent === 'function') el.dispatchEvent(new PointerEvent('pointerdown', opts));
+        el.dispatchEvent(new MouseEvent('mousedown', opts));
+        if (typeof PointerEvent === 'function') el.dispatchEvent(new PointerEvent('pointerup', opts));
+        el.dispatchEvent(new MouseEvent('mouseup', opts));
+        el.dispatchEvent(new MouseEvent('click', opts));
+      } catch (e) { try { el.click(); } catch (e2) { /* noop */ } }
+    },
+    fmtMoney(v) {
+      const sign = v < 0 ? '-' : '';
+      return sign + '$' + Math.abs(Number(v || 0)).toFixed(2);
+    },
+    parseBalance(text) {
+      if (!text) return null;
+      let s = String(text).replace(/[^\d.,'-]/g, '');
+      if (!s) return null;
+      const hasC = s.indexOf(',') >= 0, hasD = s.indexOf('.') >= 0;
+      if (hasC && hasD) {
+        if (s.lastIndexOf(',') > s.lastIndexOf('.')) s = s.replace(/\./g, '').replace(',', '.');  // EU: 10.500,50
+        else s = s.replace(/,/g, '');                                                            // US: 10,500.50
+      } else if (hasC) {
+        const parts = s.split(',');
+        if (parts.length === 2 && parts[1].length !== 3) s = s.replace(',', '.');  // decimal comma
+        else s = s.replace(/,/g, '');                                              // thousands
+      }
+      const n = parseFloat(s);
+      return isNaN(n) ? null : n;
+    },
+    hhmmss() {
+      const d = new Date();
+      return d.toTimeString().slice(0, 8);
+    }
+  };
+
+  const Log = {
+    ring: [],
+    max: 120,
+    _once: {},
+    push(msg, lvl) {
+      lvl = lvl || 'info';
+      const line = { t: Util.hhmmss(), msg: String(msg).slice(0, 160), lvl };
+      this.ring.push(line);
+      if (this.ring.length > this.max) this.ring.shift();
+      try {
+        const style = lvl === 'err' ? 'color:#ef4444' : lvl === 'warn' ? 'color:#f59e0b' : lvl === 'ok' ? 'color:#22c55e' : lvl === 'trade' ? 'color:#38bdf8' : 'color:#9ca3af';
+        console.log('%c[QXBOT ' + line.t + '] %c' + line.msg, 'color:#38bdf8', style);
+      } catch (e) { /* noop */ }
+      if (globalThis.QXBOT && globalThis.QXBOT._onLog) { try { globalThis.QXBOT._onLog(line); } catch (e) { /* noop */ } }
+      return line;
+    },
+    /* v1.3: same as push() but throttled — same key logs once per cooldown */
+    pushOnce(key, msg, lvl, cd) {
+      const t = Util.now();
+      if (this._once[key] && t - this._once[key] < (cd || 60)) return null;
+      this._once[key] = t;
+      return this.push(msg, lvl);
+    }
+  };
+
+  /* ── INDICATOR ENGINE (pure, node-testable) ─────────────────────────── */
+  const Engine = {
+
+    smaSeries(vals, n) {
+      const out = new Array(vals.length).fill(null);
+      if (vals.length < n) return out;
+      let sum = 0;
+      for (let i = 0; i < vals.length; i++) {
+        sum += vals[i];
+        if (i >= n) sum -= vals[i - n];
+        if (i >= n - 1) out[i] = sum / n;
+      }
+      return out;
+    },
+
+    emaSeries(vals, n) {
+      const out = new Array(vals.length).fill(null);
+      if (vals.length < n) return out;
+      const k = 2 / (n + 1);
+      let sum = 0;
+      for (let i = 0; i < n; i++) sum += vals[i];
+      let prev = sum / n;
+      out[n - 1] = prev;
+      for (let i = n; i < vals.length; i++) {
+        prev = vals[i] * k + prev * (1 - k);
+        out[i] = prev;
+      }
+      return out;
+    },
+
+    /* Wilder RSI */
+    rsiSeries(closes, n) {
+      n = n || 14;
+      const out = new Array(closes.length).fill(null);
+      if (closes.length < n + 1) return out;
+      let gain = 0, loss = 0;
+      for (let i = 1; i <= n; i++) {
+        const d = closes[i] - closes[i - 1];
+        if (d >= 0) gain += d; else loss -= d;
+      }
+      gain /= n; loss /= n;
+      out[n] = loss === 0 ? 100 : 100 - 100 / (1 + gain / loss);
+      for (let i = n + 1; i < closes.length; i++) {
+        const d = closes[i] - closes[i - 1];
+        const g = d > 0 ? d : 0, l = d < 0 ? -d : 0;
+        gain = (gain * (n - 1) + g) / n;
+        loss = (loss * (n - 1) + l) / n;
+        out[i] = loss === 0 ? 100 : 100 - 100 / (1 + gain / loss);
+      }
+      return out;
+    },
+
+    bollingerSeries(closes, n, k) {
+      n = n || 20; k = k || 2;
+      const mid = Engine.smaSeries(closes, n);
+      const up = new Array(closes.length).fill(null);
+      const lo = new Array(closes.length).fill(null);
+      for (let i = n - 1; i < closes.length; i++) {
+        let s = 0;
+        for (let j = i - n + 1; j <= i; j++) {
+          const d = closes[j] - mid[i];
+          s += d * d;
+        }
+        const sd = Math.sqrt(s / n);
+        up[i] = mid[i] + k * sd;
+        lo[i] = mid[i] - k * sd;
+      }
+      return { mid, up, lo };
+    },
+
+    stochSeries(candles, n, smooth) {
+      n = n || 14; smooth = smooth || 3;
+      if (candles.length < n) return { k: [], d: [] };
+      const raw = [];
+      for (let i = n - 1; i < candles.length; i++) {
+        let hh = -Infinity, ll = Infinity;
+        for (let j = i - n + 1; j <= i; j++) {
+          if (candles[j].h > hh) hh = candles[j].h;
+          if (candles[j].l < ll) ll = candles[j].l;
+        }
+        const c = candles[i].c;
+        raw.push(hh === ll ? 50 : ((c - ll) / (hh - ll)) * 100);
+      }
+      const k = Engine.smaSeries(raw, smooth).filter(v => v !== null);
+      const d = Engine.smaSeries(k, smooth).filter(v => v !== null);
+      return { k, d };
+    },
+
+    macdSeries(closes, f, s, sig) {
+      f = f || 12; s = s || 26; sig = sig || 9;
+      if (closes.length < s + sig) return { macd: [], signal: [], hist: [] };
+      const ef = Engine.emaSeries(closes, f);
+      const es = Engine.emaSeries(closes, s);
+      const macd = [];
+      for (let i = s - 1; i < closes.length; i++) macd.push(ef[i] - es[i]);
+      const signal = Engine.emaSeries(macd, sig);
+      const off = macd.length - signal.length;
+      const hist = [];
+      for (let i = 0; i < signal.length; i++) hist.push(macd[i + off] - signal[i]);
+      return { macd, signal, hist };
+    }
+  };
+
+  /* ── STRATEGIES (pure) — each returns {dir, strength, reason} ───────── */
+  const Strategies = {
+
+    rsi(candles) {
+      if (!candles || candles.length < 16) return null;
+      const closes = candles.map(c => c.c);
+      const series = Engine.rsiSeries(closes, 14);
+      const v = series[series.length - 1];
+      if (v === null || v === undefined) return null;
+      if (v <= 30) return { dir: 'call', strength: 1, reason: 'RSI ' + v.toFixed(1) + ' oversold' };
+      if (v <= 35) return { dir: 'call', strength: 0.5, reason: 'RSI ' + v.toFixed(1) + ' low' };
+      if (v >= 70) return { dir: 'put', strength: 1, reason: 'RSI ' + v.toFixed(1) + ' overbought' };
+      if (v >= 65) return { dir: 'put', strength: 0.5, reason: 'RSI ' + v.toFixed(1) + ' high' };
+      return { dir: null, strength: 0, reason: 'RSI ' + v.toFixed(1) + ' neutral' };
+    },
+
+    bollinger(candles) {
+      if (!candles || candles.length < 22) return null;
+      const closes = candles.map(c => c.c);
+      const b = Engine.bollingerSeries(closes, 20, 2);
+      const i = closes.length - 1;
+      const mid = b.mid[i], up = b.up[i], lo = b.lo[i];
+      if (mid === null) return null;
+      const span = up - lo;
+      if (span <= 0) return { dir: null, strength: 0, reason: 'BB flat' };
+      const pctB = (closes[i] - lo) / span;             // 0 = lower band, 1 = upper
+      if (pctB <= 0) return { dir: 'call', strength: 1, reason: 'BB broke lower' };
+      if (pctB <= 0.06) return { dir: 'call', strength: 0.6, reason: 'BB near lower' };
+      if (pctB >= 1) return { dir: 'put', strength: 1, reason: 'BB broke upper' };
+      if (pctB >= 0.94) return { dir: 'put', strength: 0.6, reason: 'BB near upper' };
+      return { dir: null, strength: 0, reason: 'BB mid' };
+    },
+
+    ema(candles) {
+      if (!candles || candles.length < 12) return null;
+      const closes = candles.map(c => c.c);
+      const f = Engine.emaSeries(closes, 3);
+      const s = Engine.emaSeries(closes, 9);
+      const i = closes.length - 1;
+      if (f[i] === null || s[i] === null || f[i - 1] === null || s[i - 1] === null) return null;
+      const crossUp = f[i - 1] <= s[i - 1] && f[i] > s[i];
+      const crossDn = f[i - 1] >= s[i - 1] && f[i] < s[i];
+      if (crossUp) return { dir: 'call', strength: 1, reason: 'EMA 3/9 cross up' };
+      if (crossDn) return { dir: 'put', strength: 1, reason: 'EMA 3/9 cross down' };
+      if (f[i] > s[i]) return { dir: 'call', strength: 0.25, reason: 'EMA trend up' };
+      return { dir: 'put', strength: 0.25, reason: 'EMA trend down' };
+    },
+
+    stochastic(candles) {
+      if (!candles || candles.length < 18) return null;
+      const st = Engine.stochSeries(candles, 14, 3);
+      if (!st.k.length || !st.d.length) return null;
+      const k = st.k[st.k.length - 1];
+      const d = st.d[st.d.length - 1];
+      if (k === undefined || d === undefined) return null;
+      if (k < 20 && k > d) return { dir: 'call', strength: 1, reason: 'Stoch ' + k.toFixed(0) + ' cross up low' };
+      if (k < 28 && k > d) return { dir: 'call', strength: 0.5, reason: 'Stoch ' + k.toFixed(0) + ' rising low' };
+      if (k > 80 && k < d) return { dir: 'put', strength: 1, reason: 'Stoch ' + k.toFixed(0) + ' cross down high' };
+      if (k > 72 && k < d) return { dir: 'put', strength: 0.5, reason: 'Stoch ' + k.toFixed(0) + ' falling high' };
+      return { dir: null, strength: 0, reason: 'Stoch ' + k.toFixed(0) + ' neutral' };
+    },
+
+    candleRev(candles) {
+      if (!candles || candles.length < 5) return null;
+      let streak = 0;
+      const last = candles[candles.length - 1];
+      const base = last.c >= last.o ? 1 : -1;
+      for (let i = candles.length - 1; i >= 0; i--) {
+        const c = candles[i];
+        const dir = c.c >= c.o ? 1 : -1;
+        if (dir === base) streak++; else break;
+      }
+      if (base === -1 && streak >= 3) {
+        return { dir: 'call', strength: streak >= 4 ? 1 : 0.7, reason: streak + ' red candles -> reverse' };
+      }
+      if (base === 1 && streak >= 3) {
+        return { dir: 'put', strength: streak >= 4 ? 1 : 0.7, reason: streak + ' green candles -> reverse' };
+      }
+      return { dir: null, strength: 0, reason: 'no candle streak' };
+    },
+
+    macdSig(candles) {
+      if (!candles || candles.length < 36) return null;
+      const closes = candles.map(c => c.c);
+      const m = Engine.macdSeries(closes, 12, 26, 9);
+      if (m.hist.length < 2) return null;
+      const h1 = m.hist[m.hist.length - 1], h2 = m.hist[m.hist.length - 2];
+      if (h1 > 0 && h2 <= 0) return { dir: 'call', strength: 1, reason: 'MACD hist flip up' };
+      if (h1 < 0 && h2 >= 0) return { dir: 'put', strength: 1, reason: 'MACD hist flip down' };
+      return { dir: null, strength: 0, reason: 'MACD neutral' };
+    },
+
+    /* SMART CONFLUENCE — weighted vote of all indicators */
+    smart(candles) {
+      if (!candles || candles.length < 25) return null;
+      const parts = [];
+      const push = (name, w, r) => { if (r && r.dir) parts.push({ name, w, dir: r.dir, strength: r.strength, reason: r.reason }); };
+      push('RSI', 0.22, Strategies.rsi(candles));
+      push('BB', 0.20, Strategies.bollinger(candles));
+      push('EMA', 0.18, Strategies.ema(candles));
+      push('STOCH', 0.15, Strategies.stochastic(candles));
+      push('CANDLE', 0.13, Strategies.candleRev(candles));
+      push('MACD', 0.12, Strategies.macdSig(candles));
+
+      let score = 0;
+      for (const p of parts) score += (p.dir === 'call' ? 1 : -1) * p.w * p.strength;
+
+      const thr = CFG.smartThreshold;
+      const detail = parts.map(p => p.name + '(' + p.dir + ' ' + p.strength.toFixed(1) + ')').join(' + ');
+      if (score >= thr) {
+        return { dir: 'call', strength: Util.clamp(score / (thr * 2), 0, 1), score, reason: 'CONFLUENCE ' + score.toFixed(2) + ' | ' + detail };
+      }
+      if (score <= -thr) {
+        return { dir: 'put', strength: Util.clamp(-score / (thr * 2), 0, 1), score, reason: 'CONFLUENCE ' + score.toFixed(2) + ' | ' + detail };
+      }
+      return { dir: null, strength: 0, score, reason: 'conflict ' + score.toFixed(2) + ' | ' + (detail || 'no signal') };
+    },
+
+    run(name, candles) {
+      switch (name) {
+        case 'rsi': return Strategies.rsi(candles);
+        case 'bb': return Strategies.bollinger(candles);
+        case 'ema': return Strategies.ema(candles);
+        case 'stoch': return Strategies.stochastic(candles);
+        case 'candle': return Strategies.candleRev(candles);
+        case 'macd': return Strategies.macdSig(candles);
+        default: return Strategies.smart(candles);
+      }
+    }
+  };
+
+  /* ── CANDLE BUILDING FROM TICKS (pure) ──────────────────────────────── */
+  const Candles = {
+    /* bucket a tick into a candle array (in place) */
+    addTick(buckets, tfSec, ts, price) {
+      if (buckets === null || buckets === undefined || typeof tfSec !== 'number') return null;
+      if (!isFinite(ts) || !isFinite(price)) return null;
+      const slot = Math.floor(ts / tfSec) * tfSec;
+      const last = buckets.length ? buckets[buckets.length - 1] : null;
+      if (last && last.t === slot) {
+        if (price > last.h) last.h = price;
+        if (price < last.l) last.l = price;
+        last.c = price;
+        last.n++;
+      } else {
+        if (last && slot < last.t) return last;         // out-of-order tick, ignore
+        buckets.push({ t: slot, o: price, h: price, l: price, c: price, n: 1 });
+        if (buckets.length > 240) buckets.shift();
+      }
+      return buckets[buckets.length - 1];
+    },
+    ready(buckets, minCandles) {
+      return Array.isArray(buckets) && buckets.filter(c => c.n >= 2).length >= minCandles;
+    }
+  };
+
+  /* ── MONEY MANAGEMENT (pure) ────────────────────────────────────────── */
+  const MM = {
+    maxStep(mtg) { return mtg === 'mtg1' ? 1 : mtg === 'mtg2' ? 2 : 0; },
+    nextAmount(mtg, base, step) {
+      if (mtg === 'none' || !mtg) return Util.round2(base);   // FLAT: never multiply
+      const mult = Math.pow(2, Util.clamp(step, 0, MM.maxStep(mtg)));
+      return Util.round2(base * mult);
+    },
+    onWin(st) { st.step = 0; },
+    onLoss(st, mtg) { st.step = st.step < MM.maxStep(mtg) ? st.step + 1 : 0; }
+  };
+
+  /* ── RISK GUARD (pure) ──────────────────────────────────────────────── */
+  const Risk = {
+    /* returns {action:'ok'|'pause'|'stop', reason} */
+    check(bal, sessionStart, lossStreak, cfg) {
+      if (sessionStart && bal) {
+        const plPct = ((bal - sessionStart) / sessionStart) * 100;
+        if (plPct <= -cfg.stopLossPct) return { action: 'stop', reason: 'STOP-LOSS ' + plPct.toFixed(1) + '% hit' };
+        if (plPct >= cfg.takeProfitPct) return { action: 'stop', reason: 'TAKE-PROFIT +' + plPct.toFixed(1) + '% reached' };
+      }
+      if (lossStreak >= cfg.stopStreak) return { action: 'stop', reason: lossStreak + ' losses in a row' };
+      if (lossStreak >= cfg.pauseAfterStreak) return { action: 'pause', reason: lossStreak + ' losses -> pause ' + cfg.pauseSec + 's' };
+      return { action: 'ok', reason: '' };
+    }
+  };
+
+  /* ── STORE: ticks + candles per asset ───────────────────────────────── */
+  const Store = {
+    ticks: new Map(),      // normKey -> [{ts,p}]
+    candles: new Map(),    // normKey -> Map(tfSec -> [candle])
+    lastStreamAsset: null, // raw asset id from WS stream
+    TFS: [5, 15, 30, 60],
+
+    addTick(rawAsset, ts, price) {
+      const key = Util.norm(rawAsset);
+      if (!key || !isFinite(price)) return;
+      if (typeof ts !== 'number' || !isFinite(ts)) ts = Util.now();
+      else if (ts > 1e12) ts = Math.floor(ts / 1000);   // ms → seconds
+      let arr = this.ticks.get(key);
+      if (!arr) { arr = []; this.ticks.set(key, arr); }
+      const lastP = arr.length ? arr[arr.length - 1].p : null;
+      arr.push({ ts, p: price });
+      if (arr.length > 900) arr.splice(0, arr.length - 900);
+      let cmap = this.candles.get(key);
+      if (!cmap) { cmap = new Map(); this.candles.set(key, cmap); }
+      for (const tf of this.TFS) {
+        let b = cmap.get(tf);
+        if (!b) { b = []; cmap.set(tf, b); }
+        Candles.addTick(b, tf, ts, price);
+      }
+      this.lastStreamAsset = rawAsset;
+      Bot.lastTickTs = Util.now();
+    },
+
+    getCandles(rawAsset, tf) {
+      const cmap = this.candles.get(Util.norm(rawAsset));
+      return cmap ? (cmap.get(tf) || []) : [];
+    },
+
+    getTicks(rawAsset) {
+      return this.ticks.get(Util.norm(rawAsset)) || [];
+    },
+
+    /* warm candles from history response items {time,open,close,min,max} */
+    warmHistory(rawAsset, items) {
+      if (!Array.isArray(items) || !items.length) return false;
+      const key = Util.norm(rawAsset);
+      let cmap = this.candles.get(key);
+      if (!cmap) { cmap = new Map(); this.candles.set(key, cmap); }
+      // guess item period from first two timestamps
+      let period = 60;
+      if (items.length > 1 && items[1].time) period = Util.clamp(items[1].time - items[0].time, 1, 300);
+      const arr = [];
+      for (const it of items) {
+        if (!it || typeof it.time !== 'number') continue;
+        arr.push({
+          t: it.time,
+          o: it.open, c: it.close,
+          h: it.max !== undefined ? it.max : Math.max(it.open, it.close),
+          l: it.min !== undefined ? it.min : Math.min(it.open, it.close),
+          n: 9
+        });
+      }
+      cmap.set(period, arr.slice(-240));
+      Log.push('History warm: ' + key + ' ' + arr.length + ' x ' + period + 's candles', 'ok');
+      return true;
+    },
+
+    frozen(rawAsset) {
+      const t = this.getTicks(rawAsset);
+      const k = CFG.frozenTicks;
+      if (t.length < k) return false;
+      const lastP = t[t.length - 1].p;
+      for (let i = t.length - 2; i > t.length - 1 - k; i--) {
+        if (t[i] && t[i].p !== lastP) return false;
+      }
+      return true;
+    }
+  };
+
+  /* ── PAYOUT DATABASE ────────────────────────────────────────────────── */
+  const PayoutDB = {
+    map: new Map(),        // normKey -> {id, display, payout, otc, src, ts}
+    setFromProfile(id, payout) {
+      const key = Util.norm(id);
+      const prev = this.map.get(key);
+      this.map.set(key, {
+        id, display: prev && prev.display ? prev.display : id,
+        payout: Number(payout), otc: /otc/i.test(id),
+        src: prev && prev.src === 'dom' ? 'dom' : 'ws', ts: Util.now()
+      });
+    },
+    setFromDOM(displayName, payout) {
+      const key = Util.norm(displayName);
+      const prev = this.map.get(key);
+      this.map.set(key, {
+        id: prev && prev.id ? prev.id : displayName,
+        display: displayName, payout: Number(payout),
+        otc: /otc/i.test(displayName), src: 'dom', ts: Util.now()
+      });
+    },
+    get(rawAsset) { return this.map.get(Util.norm(rawAsset)) || null; },
+    qualified(minPayout, onlyOTC) {
+      const out = [];
+      this.map.forEach(v => {
+        if (v.payout >= minPayout && (!onlyOTC || v.otc)) out.push(v);
+      });
+      out.sort((a, b) => b.payout - a.payout);
+      return out;
+    },
+    size() { return this.map.size; },
+    stats() {
+      let total = 0, otc = 0, best = null;
+      this.map.forEach(v => {
+        total++;
+        if (v.otc && typeof v.payout === 'number' && v.payout > 0) { otc++; if (!best || v.payout > best.payout) best = v; }
+      });
+      return { total, otc, best };
+    },
+    setFromWS(name, payout) { this.setFromProfile(name, payout); },
+
+    /* deep-walk ANY WS payload shape and pull out (asset, payout) pairs.
+       Handles: updateAssets / updateAssets_s, map {name:{payout}},
+       tuple rows [id,"EURUSD_otc",92], flat {pair, percent} objects. */
+    harvestDeep(node, depth) {
+      depth = depth || 0;
+      if (!node || typeof node !== 'object' || depth > 7) return 0;
+      const okPct = (v, k) =>
+        typeof v === 'number' && isFinite(v) && v >= 5 && v <= 100 &&
+        !(k && /open|close|high|low|price|quote|strike|bid|ask|volume|balance/i.test(k));
+      let n = 0;
+      if (Array.isArray(node)) {
+        for (let i = 0; i < node.length; i++) {
+          const v = node[i];
+          if (Array.isArray(v) && v.length >= 3 &&
+            typeof v[1] === 'string' && Util.isAssetName(v[1]) && okPct(v[2], null)) {
+            this.setFromWS(v[1], Math.round(v[2])); n++;
+          } else {
+            n += this.harvestDeep(v, depth + 1);
+          }
+        }
+        return n;
+      }
+      /* object: name field + payout field in the same object */
+      let name = null, payout = null;
+      for (const k in node) {
+        const v = node[k];
+        const tp = typeof v;
+        if (tp === 'string') {
+          if (!name && Util.isAssetName(v)) name = v;
+        } else if (tp === 'number' && payout === null && okPct(v, k) &&
+          (/payout|profit|percent/i.test(k) || Number.isInteger(v))) {
+          payout = v;
+        } else if (v && tp === 'object') {
+          n += this.harvestDeep(v, depth + 1);
+        }
+      }
+      if (name && payout !== null) { this.setFromWS(name, Math.round(payout)); n++; }
+      /* map-like: the key itself is the asset name */
+      for (const k in node) {
+        const v = node[k];
+        if (!Util.isAssetName(k)) continue;
+        let p = null;
+        if (typeof v === 'number' && okPct(v, k) && Number.isInteger(v)) p = v;
+        else if (v && typeof v === 'object') {
+          for (const kk in v) {
+            const vv = v[kk];
+            if (typeof vv === 'number' && okPct(vv, kk) &&
+              (/payout|profit|percent/i.test(kk) || Number.isInteger(vv))) { p = vv; break; }
+          }
+        }
+        if (p !== null) { this.setFromWS(k, Math.round(p)); n++; }
+      }
+      return n;
+    }
+  };
+
+  /* ── WEBSOCKET HOOK + FRAME PARSER ──────────────────────────────────── */
+  const WS = {
+    sock: null, captured: false, hookedSock: null,
+    _frameLog: [], _sentLog: [], _binPending: [], _stats: { text: 0, bin: 0 },
+    _patched: false, _origSend: null, _pendingAcks: new Map(),
+    lastFrameTs: 0,
+
+    patch() {
+      if (this._patched || typeof WebSocket === 'undefined') return;
+      this._patched = true;
+      const self = this;
+      const origSend = WebSocket.prototype.send;
+      this._origSend = origSend;
+      WebSocket.prototype.send = function (data) {
+        try { self.logSent(data); } catch (e) { /* noop */ }
+        try { self.capture(this); } catch (e) { /* noop */ }
+        return origSend.call(this, data);
+      };
+      /* also auto-capture any NEW socket created after bot load */
+      try {
+        const OrigWS = window.WebSocket;
+        this._OrigCtor = OrigWS;
+        const Patched = function (url, protos) {
+          const ws = protos === undefined ? new OrigWS(url) : new OrigWS(url, protos);
+          try { self.capture(ws); } catch (e) { /* noop */ }
+          return ws;
+        };
+        Patched.prototype = OrigWS.prototype;
+        ['CONNECTING', 'OPEN', 'CLOSING', 'CLOSED'].forEach(k => { try { Patched[k] = OrigWS[k]; } catch (e) { /* noop */ } });
+        window.WebSocket = Patched;
+      } catch (e) { /* noop */ }
+      Log.push('WS hook installed (waiting for broker heartbeat...)');
+    },
+
+    capture(ws) {
+      if (this.sock === ws || this.hookedSock === ws) return;
+      if (this.sock && this.sock.readyState === 1) return;   // healthy socket already captured
+      if (this.hookedSock === ws) return;
+      this.sock = ws;
+      this.captured = true;
+      try { ws.binaryType = 'arraybuffer'; } catch (e) { /* noop */ }   /* binary events arrive as ArrayBuffer */
+      const self = this;
+      ws.addEventListener('message', ev => { try { self.onFrame(ev.data); } catch (e) { /* noop */ } });
+      ws.addEventListener('close', () => {
+        if (self.sock === ws) { self.sock = null; self.captured = false; Log.push('WS closed — will re-capture on next activity', 'warn'); }
+      });
+      Log.push('WS captured ✔ (' + (ws.url || 'socket') + ')', 'ok');
+    },
+
+    sendJSON(obj) {
+      if (!this.sock || this.sock.readyState !== 1) return false;
+      try {
+        this._origSend ? this._origSend.call(this.sock, JSON.stringify(obj)) : this.sock.send(JSON.stringify(obj));
+        return true;
+      } catch (e) { return false; }
+    },
+
+    requestHistory(rawAsset) {
+      const ok = this.sendJSON({ action: 'loadHistoryPeriod', asset: rawAsset, index: 200, time: Util.now() });
+      if (ok) Log.push('History requested for ' + rawAsset);
+      return ok;
+    },
+
+    subscribe(rawAsset) {
+      return this.sendJSON({ action: 'changeSymbol', asset: rawAsset, index: Util.now() });
+    },
+
+    /* parse raw frame text → object (raw JSON + socket.io 42/451 wrappers) */
+    parse(text) {
+      if (typeof text !== 'string' || !text) return null;
+      try { return JSON.parse(text); } catch (e) { /* fallthrough */ }
+      const start = text.indexOf('{');
+      const end = text.lastIndexOf('}');
+      if (start >= 0 && end > start) {
+        try {
+          const obj = JSON.parse(text.slice(start, end + 1));
+          /* socket.io binary-event placeholder? prefer the array path to keep the event name */
+          if (!(obj && obj._placeholder === true)) return obj;
+        } catch (e) { /* fallthrough */ }
+      }
+      /* socket.io array framing: 42["eventName",payload] */
+      const a = text.indexOf('[');
+      const b = text.lastIndexOf(']');
+      if (a >= 0 && b > a) {
+        try {
+          const arr = JSON.parse(text.slice(a, b + 1));
+          if (Array.isArray(arr) && arr.length && typeof arr[0] === 'string') {
+            return { __event: arr[0], __payload: arr.length > 1 ? arr[1] : null };
+          }
+        } catch (e) { /* noop */ }
+      }
+      return null;
+    },
+
+    payoutPulse() {
+      const s = PayoutDB.size();
+      if (s && s - (this._payoutLogN || 0) >= 5) {
+        this._payoutLogN = s;
+        const st = PayoutDB.stats();
+        Log.push('Payout DB from stream: ' + s + ' assets (' + st.otc + ' OTC)', 'ok');
+      }
+    },
+
+    logFrame(s) {
+      this._frameLog.push({ t: Util.now(), s: String(s).slice(0, 140) });
+      if (this._frameLog.length > 60) this._frameLog.shift();
+    },
+
+    logSent(data) {
+      const isStr = typeof data === 'string';
+      this._sentLog.push({ t: Util.now(), s: isStr ? data.slice(0, 140) : (data && data.byteLength !== undefined ? '<binary ' + data.byteLength + 'B>' : '<data>') });
+      if (this._sentLog.length > 60) this._sentLog.shift();
+    },
+
+    /* incoming frame: string, Blob or ArrayBuffer (socket.io binary events) */
+    onFrame(data) {
+      const self = this;
+      if (data instanceof ArrayBuffer) { this._onBinary(data); return; }
+      if (typeof Blob !== 'undefined' && data instanceof Blob) {
+        try { data.text().then(t => self.onFrame(t)).catch(() => { /* noop */ }); } catch (e) { /* noop */ }
+        return;
+      }
+      if (data && typeof data !== 'string' && typeof data.text === 'function') {
+        try { data.text().then(t => self.onFrame(t)).catch(() => { /* noop */ }); } catch (e) { /* noop */ }
+        return;
+      }
+      const msg = this.parse(data);
+      this._stats.text++;
+      this.logFrame(data);
+      if (!msg) return;
+      this.lastFrameTs = Util.now();
+      /* socket.io binary-event placeholder: 451-["event",{"_placeholder":true,"num":0}] */
+      if (msg.__payload && msg.__payload._placeholder) {
+        this._binPending.push(msg.__event);
+        return;
+      }
+      try {
+        const target = msg.__event !== undefined ? msg.__payload : msg;
+        if (PayoutDB.harvestDeep(target)) this.payoutPulse();
+      } catch (e) { /* noop */ }
+      try { this.handle(msg); } catch (e) { Log.push('frame err: ' + e.message, 'err'); }
+    },
+
+    /* binary attachment: decode UTF-8 JSON and pair with the queued event */
+    _onBinary(buf) {
+      this._stats.bin++;
+      let text = '';
+      try { text = new TextDecoder('utf-8', { fatal: false }).decode(buf); } catch (e) { return; }
+      this.logFrame('<bin ' + buf.byteLength + 'B> ' + text.slice(0, 100));
+      this.lastFrameTs = Util.now();
+      let payload = null;
+      try { payload = JSON.parse(text); } catch (e) { payload = null; }
+      if (payload === null) payload = { __raw: text.slice(0, 200) };   /* non-JSON binary: keep sample for debug */
+      const ev = this._binPending.length ? this._binPending.shift() : 'binary';
+      try { if (PayoutDB.harvestDeep(payload)) this.payoutPulse(); } catch (e) { /* noop */ }
+      try { this.handle({ __event: ev, __payload: payload }); } catch (e) { /* noop */ }
+    },
+
+    /* tap fetch/XHR: harvest payouts from REST responses too */
+    patchNet() {
+      if (this._netPatched || typeof window === 'undefined' || !window.fetch) return;
+      this._netPatched = true;
+      const self = this;
+      this._origFetch = window.fetch;
+      window.fetch = function () {
+        const p = self._origFetch.apply(this, arguments);
+        try {
+          p.then(res => {
+            try {
+              const ct = res.headers && res.headers.get ? (res.headers.get('content-type') || '') : '';
+              if (!/json|text/i.test(ct)) return;
+              res.clone().text().then(t => {
+                if (!t || t.length > 800000) return;
+                const probe = t.slice(0, 3000);
+                if (!/_otc|payout|open_payout|"assets"/i.test(probe)) return;
+                const j = JSON.parse(t);
+                if (PayoutDB.harvestDeep(j)) self.payoutPulse();
+              }).catch(() => { /* noop */ });
+            } catch (e) { /* noop */ }
+          }).catch(() => { /* noop */ });
+        } catch (e) { /* noop */ }
+        return p;
+      };
+      if (typeof XMLHttpRequest !== 'undefined') {
+        const OrigOpen = XMLHttpRequest.prototype.open;
+        const OrigSend = XMLHttpRequest.prototype.send;
+        this._origXhrOpen = OrigOpen;
+        this._origXhrSend = OrigSend;
+        XMLHttpRequest.prototype.open = function (m, u) { try { this._qxUrl = String(u || ''); } catch (e) { /* noop */ } return OrigOpen.apply(this, arguments); };
+        XMLHttpRequest.prototype.send = function () {
+          const xhr = this;
+          try {
+            xhr.addEventListener('load', () => {
+              try {
+                const t = xhr.responseText;
+                if (!t || t.length > 800000) return;
+                const probe = t.slice(0, 3000);
+                if (!/_otc|payout|open_payout/i.test(probe)) return;
+                const j = JSON.parse(t);
+                if (PayoutDB.harvestDeep(j)) self.payoutPulse();
+              } catch (e) { /* noop */ }
+            });
+          } catch (e) { /* noop */ }
+          return OrigSend.apply(this, arguments);
+        };
+      }
+      Log.push('fetch/XHR payout tap installed', 'info');
+    },
+
+    unpatchNet() {
+      try { if (this._origFetch) window.fetch = this._origFetch; } catch (e) { /* noop */ }
+      try {
+        if (this._origXhrOpen) { XMLHttpRequest.prototype.open = this._origXhrOpen; XMLHttpRequest.prototype.send = this._origXhrSend; }
+      } catch (e) { /* noop */ }
+      this._netPatched = false;
+    },
+
+    handle(msg) {
+      if (msg && msg.__event !== undefined) msg = msg.__payload || {};
+      /* price stream */
+      if (msg.asset && Array.isArray(msg.quotes)) {
+        for (const q of msg.quotes) {
+          if (Array.isArray(q)) Store.addTick(msg.asset, Number(q[0]), Number(q[1]));
+        }
+        return;
+      }
+      if (msg.asset && typeof msg.price === 'number' && msg.ts) {
+        Store.addTick(msg.asset, Number(msg.ts), msg.price);
+        return;
+      }
+      /* asset profiles with payouts */
+      if (msg.assets && typeof msg.assets === 'object') {
+        let n = 0;
+        for (const id in msg.assets) {
+          const prof = msg.assets[id];
+          if (prof && typeof prof.open_payout === 'number') { PayoutDB.setFromProfile(id, prof.open_payout); n++; }
+        }
+        if (n) Log.push('Payout profiles received: ' + n + ' assets', 'ok');
+        return;
+      }
+      /* history candles */
+      if (Array.isArray(msg.candles) || (Array.isArray(msg.data) && msg.data.length && msg.data[0] && msg.data[0].open !== undefined)) {
+        const items = msg.candles || msg.data;
+        if (msg.asset || Store.lastStreamAsset) Store.warmHistory(msg.asset || Store.lastStreamAsset, items);
+        return;
+      }
+      /* order ack */
+      if (msg.requestId && this._pendingAcks.has(msg.requestId)) {
+        const cb = this._pendingAcks.get(msg.requestId);
+        this._pendingAcks.delete(msg.requestId);
+        cb(msg);
+        return;
+      }
+      /* profit / result frames */
+      if (typeof msg.profit === 'number' && msg.pair || (msg.action === 'closeOrder' && typeof msg.profit === 'number')) {
+        Bot.onWsResult(msg);
+        return;
+      }
+      /* balance updates */
+      const bal = msg.demoBalance !== undefined ? msg.demoBalance
+        : msg.realBalance !== undefined ? msg.realBalance
+        : (msg.balance && typeof msg.balance === 'object' ? (msg.balance.demoBalance !== undefined ? msg.balance.demoBalance : msg.balance.realBalance) : undefined);
+      if (bal !== undefined) {
+        Balance.set(Number(bal), msg.realBalance !== undefined ? false : true);
+        return;
+      }
+      if (typeof msg.isDemo === 'boolean' || typeof msg.isDemo === 'number') {
+        Balance.setDemo(!!msg.isDemo);
+      }
+    },
+
+    awaitAck(requestId, timeoutMs) {
+      return new Promise(resolve => {
+        let done = false;
+        const t = setTimeout(() => { if (!done) { done = true; this._pendingAcks.delete(requestId); resolve(null); } }, timeoutMs || 3000);
+        this._pendingAcks.set(requestId, msg => { if (!done) { done = true; clearTimeout(t); resolve(msg); } });
+      });
+    }
+  };
+
+  /* ── DOM SCANNER: find assets + payouts, switch market ──────────────── */
+  const Scanner = {
+    scanning: false, lastScanTs: 0, lastScanCount: 0, taughtSel: null, _obs: null,
+    _seedTs: 0, _visTs: 0,
+
+    /* ---- helpers --------------------------------------------------------- */
+    restoreTaught() {
+      if (this.taughtSel !== null) return;
+      try { this.taughtSel = localStorage.getItem('qxbot_v1_assetSel') || null; } catch (e) { this.taughtSel = null; }
+    },
+    visible(el) {
+      const r = el.getBoundingClientRect();
+      return r.width > 2 && r.height > 2 && r.bottom > 0 && r.top < (window.innerHeight || 900);
+    },
+    rowText(el) { return (el.textContent || '').replace(/\s+/g, ' ').trim(); },
+    nameFromRow(txt) { return txt.replace(/[+\-−]?\d{1,3}(?:[.,]\d+)?\s*%.*/, '').replace(/[()]/g, '').trim(); },
+    countRows() {
+      let n = 0;
+      const els = document.querySelectorAll('div, li, span, button, a, p');
+      for (const el of els) {
+        if (el.children.length > 8) continue;
+        const txt = this.rowText(el);
+        if (txt.length < 6 || txt.length > 60) continue;
+        if (!Util.pct(txt)) continue;
+        if (Util.isAssetName(this.nameFromRow(txt))) n++;
+      }
+      return n;
+    },
+    harvestRows() {
+      let added = 0;
+      const seen = new Set();
+      const els = document.querySelectorAll('div, li, span, button, a, p');
+      for (const el of els) {
+        if (el.children.length > 8) continue;
+        const txt = this.rowText(el);
+        if (txt.length < 6 || txt.length > 60) continue;
+        const payout = Util.pct(txt);
+        if (payout === null) continue;
+        const name = this.nameFromRow(txt);
+        if (!Util.isAssetName(name)) continue;
+        const key = Util.norm(name);
+        if (seen.has(key)) continue;
+        seen.add(key);
+        const prev = PayoutDB.get(name);
+        if (!prev || prev.payout !== payout) { PayoutDB.setFromDOM(name, payout); added++; }
+      }
+      return added;
+    },
+
+    /* v1.3: collect elements across SHADOW DOM and same-origin iframes.
+       Some QUOTEX panels render inside shadow roots — querySelectorAll
+       never sees those, which is one reason payout rows went unnoticed. */
+    deepQueryAll() {
+      const out = [];
+      const walk = (root, depth) => {
+        if (!root || depth > 6 || out.length > 5000) return;
+        let els = [];
+        try { els = root.querySelectorAll('*'); } catch (e) { return; }
+        for (const el of els) {
+          out.push(el);
+          try { if (el.shadowRoot) walk(el.shadowRoot, depth + 1); } catch (e) { /* noop */ }
+        }
+        try {
+          const frames = root.querySelectorAll('iframe');
+          for (const f of frames) {
+            let d = null;
+            try { d = f.contentDocument; } catch (e) { d = null; }
+            if (d) walk(d, depth + 1);
+          }
+        } catch (e) { /* noop */ }
+      };
+      try { walk(document, 0); } catch (e) { /* noop */ }
+      return out;
+    },
+
+    /* v1.3: aggressive whole-page harvest — catches rows where the asset
+       name and the % live in SIBLING nodes and containers with icons/badges
+       (children > 4 was too strict). Throttled to once per 5s unless forced. */
+    harvestVisible(force) {
+      if (typeof document === 'undefined' || document.hidden) return 0;
+      const t = Util.now();
+      if (!force && this._visTs && t - this._visTs < 5) return 0;
+      this._visTs = t;
+      let added = 0;
+      const els = this.deepQueryAll();
+      const seen = new Set();
+      /* pass 1: full row text inside one element (name + % together) */
+      for (const el of els) {
+        if (el.children && el.children.length > 8) continue;
+        const txt = this.rowText(el);
+        if (!txt || txt.length < 6 || txt.length > 60) continue;
+        const payout = Util.pct(txt);
+        if (payout === null) continue;
+        const name = this.nameFromRow(txt);
+        if (!Util.isAssetName(name)) continue;
+        const key = Util.norm(name);
+        if (seen.has(key)) continue;
+        seen.add(key);
+        const prev = PayoutDB.get(name);
+        if (!prev || prev.payout !== payout) { PayoutDB.setFromDOM(name, payout); added++; }
+      }
+      /* pass 2: sibling pairing — <span>EURUSD_otc</span><span>92%</span> */
+      const isPctOnly = s => /^[+\-−]?\d{1,3}(?:[.,]\d+)?\s*%$/.test(s);
+      for (const el of els) {
+        const txt = this.rowText(el);
+        if (!txt || txt.length > 10 || !isPctOnly(txt)) continue;
+        const payout = Util.pct(txt);
+        if (payout === null) continue;
+        let name = null;
+        const sibs = el.parentElement ? el.parentElement.children : [];
+        for (const s of sibs) {
+          if (s === el) continue;
+          const st = this.rowText(s);
+          if (st && st.length <= 24 && Util.isAssetName(st)) { name = st; break; }
+        }
+        if (!name && el.parentElement) {
+          const pt = this.rowText(el.parentElement);
+          if (pt && pt.length <= 48 && Util.isAssetName(this.nameFromRow(pt))) name = this.nameFromRow(pt);
+        }
+        if (!name) continue;
+        const key = Util.norm(name);
+        if (seen.has(key)) continue;
+        seen.add(key);
+        const prev = PayoutDB.get(name);
+        if (!prev || prev.payout !== payout) { PayoutDB.setFromDOM(name, payout); added++; }
+      }
+      return added;
+    },
+
+    /* v1.3: smallest "NAME xx%" element in the top bar = on-screen market chip.
+       Works WITHOUT the asset button — it IS usually the asset button, but we
+       only read it here, never click it. */
+    topChip() {
+      if (typeof document === 'undefined') return null;
+      const topLimit = Math.min(320, window.innerHeight || 900);
+      let best = null, bestArea = Infinity;
+      const els = this.deepQueryAll();
+      for (const el of els) {
+        if (el.children && el.children.length > 8) continue;
+        const txt = this.rowText(el);
+        if (!txt || txt.length > 48) continue;
+        const payout = Util.pct(txt);
+        if (payout === null) continue;
+        const name = this.nameFromRow(txt);
+        if (!Util.isAssetName(name)) continue;
+        let r;
+        try { r = el.getBoundingClientRect(); } catch (e) { continue; }
+        if (!r || r.width <= 0 || r.top < 0 || r.top > topLimit) continue;
+        const area = r.width * r.height;
+        if (area < bestArea) { best = { display: name, payout }; bestArea = area; }
+      }
+      return best;
+    },
+
+    /* v1.3: make sure the CURRENTLY STREAMING market exists in the payout DB,
+       even when the asset list was never opened. Without this, headless mode
+       had no payout for the on-screen market and refused to trade. */
+    seedCurrentMarket(force) {
+      const id = Store.lastStreamAsset;
+      if (!id) return null;
+      const now = Util.now();
+      if (!force && this._seedTs && now - this._seedTs < 10) return PayoutDB.get(id);
+      this._seedTs = now;
+      let payout = this.headerPayout();
+      let display = this.currentDisplay();
+      if (payout === null || !display) {
+        const chip = this.topChip();
+        if (chip) {
+          if (payout === null) payout = chip.payout;
+          if (!display) display = chip.display;
+        }
+      }
+      const prev = PayoutDB.get(id);
+      const p = payout !== null ? payout : (prev ? prev.payout : null);
+      if (p === null) return prev;
+      PayoutDB.setFromProfile(id, p);
+      const rec = PayoutDB.map.get(Util.norm(id));
+      if (rec && display && !/^\s*$/.test(display)) rec.display = display;
+      return rec;
+    },
+
+    /* v1.3: can we rotate markets? (asset button = click-to-switch) */
+    canSwitch() { return !!this.findAssetButton(); },
+
+    /* ---- asset button: taught selector + 3-tier auto-detect --------------- */
+    findAssetButton() {
+      if (typeof document === 'undefined') return null;
+      this.restoreTaught();
+      if (this.taughtSel) {
+        try {
+          const el = document.querySelector(this.taughtSel);
+          if (el && this.visible(el)) return el;
+        } catch (e) { /* stale */ }
+        this.taughtSel = null;
+        try { localStorage.removeItem('qxbot_v1_assetSel'); } catch (e) { /* noop */ }
+        Log.push('Taught asset selector stale — back to auto-detect', 'warn');
+      }
+      const topLimit = Math.min(320, window.innerHeight || 900);
+      const all = document.querySelectorAll('button, [role="button"], div, span, a, p, li, summary');
+      /* tier 1: text shape "EURUSD_otc 87%" / "EUR/USD (OTC) +92%" — smallest wins */
+      let best = null, bestArea = Infinity;
+      for (const el of all) {
+        if (el.children.length > 4) continue;
+        const txt = this.rowText(el);
+        if (!txt || txt.length > 48) continue;
+        const r = el.getBoundingClientRect();
+        if (r.width <= 0 || r.top < 0 || r.top > topLimit) continue;
+        if (!Util.pct(txt)) continue;
+        if (Util.isAssetName(this.nameFromRow(txt))) {
+          const area = r.width * r.height;
+          if (area < bestArea) { best = el; bestArea = area; }
+        }
+      }
+      if (best) return best;
+      /* tier 2: header element containing the current stream asset name */
+      const cur = Store.lastStreamAsset;
+      if (cur) {
+        const core = cur.replace(/_otc/i, '').toUpperCase();
+        if (core.length >= 3) {
+          for (const el of all) {
+            if (el.children.length > 5) continue;
+            const txt = this.rowText(el);
+            if (!txt || txt.length > 60) continue;
+            const r = el.getBoundingClientRect();
+            if (r.width <= 0 || r.top < 0 || r.top > topLimit) continue;
+            if (txt.toUpperCase().replace(/[^A-Z0-9]/g, '').indexOf(core) >= 0) return el;
+          }
+        }
+      }
+      /* tier 2.5: text-shape match anywhere on the page (skip when the asset
+         list is open — rows would false-match and clicking one changes market) */
+      if (this.countRows() < 5) {
+        let any = null, anyArea = Infinity;
+        for (const el of all) {
+          if (el.children.length > 4) continue;
+          const txt = this.rowText(el);
+          if (!txt || txt.length > 48) continue;
+          if (!Util.pct(txt)) continue;
+          if (!Util.isAssetName(this.nameFromRow(txt))) continue;
+          const r = el.getBoundingClientRect();
+          if (r.width <= 0 || r.top < 0) continue;
+          const area = r.width * r.height;
+          if (area < anyArea) { any = el; anyArea = area; }
+        }
+        if (any) return any;
+      }
+      /* tier 3: legacy class-fragment match */
+      const cands = document.querySelectorAll('[class*="asset" i], [class*="symbol" i], [class*="payout" i], button');
+      for (const el of cands) {
+        const txt = this.rowText(el);
+        if (!txt || txt.length > 60) continue;
+        const r = el.getBoundingClientRect();
+        if (r.width <= 0 || r.top < 0 || r.top > topLimit) continue;
+        if (/%|\(OTC\)|_otc/i.test(txt) && /\d/.test(txt)) return el;
+      }
+      return null;
+    },
+
+    /* ---- open / close / scan ---------------------------------------------- */
+    async openAssetList() {
+      const btn = this.findAssetButton();
+      if (!btn) { Log.pushOnce('nobtn', 'Asset button not found — open the asset list once manually (rows are read automatically), or run QXBOT.pickAsset()', 'warn'); return false; }
+      Util.fireClick(btn);
+      for (let i = 0; i < 8; i++) {          /* wait up to ~3.2s for rows */
+        await Util.sleep(400);
+        if (this.countRows() >= 3) break;
+      }
+      if (this.countRows() < 3) {            /* second attempt: some UIs ignore the first tap */
+        Util.fireClick(btn);
+        for (let i = 0; i < 4; i++) {
+          await Util.sleep(350);
+          if (this.countRows() >= 3) break;
+        }
+      }
+      return true;
+    },
+
+    async closeAssetList() {
+      /* 1) Escape (harmless if nothing is open) */
+      const esc = { key: 'Escape', code: 'Escape', keyCode: 27, which: 27, bubbles: true, cancelable: true };
+      try {
+        document.dispatchEvent(new KeyboardEvent('keydown', esc));
+        document.dispatchEvent(new KeyboardEvent('keyup', esc));
+      } catch (e) { /* noop */ }
+      await Util.sleep(220);
+      if (this.countRows() < 3) return;
+      /* 2) neutral outside click (chart canvas) */
+      const canvas = document.querySelector('canvas');
+      if (canvas) { Util.fireClick(canvas); await Util.sleep(220); }
+      if (this.countRows() < 3) return;
+      /* 3) toggle the asset button again */
+      const btn = this.findAssetButton();
+      if (btn) { Util.fireClick(btn); await Util.sleep(240); }
+    },
+
+    async scanDOM(force) {
+      if (this.scanning) return false;
+      if (!force && Util.now() - this.lastScanTs < CFG.scanRetrySec) return this.lastScanCount > 0;
+      this.scanning = true;
+      try {
+        /* rows may already be visible (list open, header chip) */
+        this.harvestRows();
+        this.harvestVisible(true);
+        this.seedCurrentMarket(true);
+        let total = PayoutDB.size();
+        if (total < 3 || force) {
+          const opened = await this.openAssetList();
+          if (opened) {
+            this.harvestRows();
+            this.harvestVisible(true);
+            total = PayoutDB.size();
+            await this.closeAssetList();
+          }
+        }
+        this.lastScanTs = Util.now();
+        this.lastScanCount = total;
+        const st = PayoutDB.stats();
+        if (total > 0) {
+          Log.push('Scan: ' + total + ' assets (' + st.otc + ' OTC' + (st.best ? ', best OTC ' + st.best.display + ' ' + st.best.payout + '%' : '') + '), ' + PayoutDB.qualified(CFG.payoutMin, CFG.onlyOTC).length + ' qualified ≥' + CFG.payoutMin + '%', 'ok');
+        } else {
+          Log.push('Scan found 0 assets — open the asset picker once (rows auto-read) or run QXBOT.pickAsset()', 'warn');
+        }
+        return total > 0;
+      } finally {
+        this.scanning = false;
+      }
+    },
+
+    /* ---- passive learning + teach mode ------------------------------------ */
+    observe() {
+      if (this._obs || typeof MutationObserver === 'undefined' || !document.body) return;
+      let timer = null;
+      this._obs = new MutationObserver(() => {
+        if (this.scanning || timer || document.hidden) return;
+        timer = setTimeout(() => {
+          timer = null;
+          try {
+            if (this.countRows() >= 5 && this.harvestRows() > 0) this.lastScanCount = PayoutDB.size();
+          } catch (e) { /* noop */ }
+        }, 700);
+      });
+      this._obs.observe(document.body, { childList: true, subtree: true });
+    },
+
+    disconnectObserver() {
+      try { if (this._obs) { this._obs.disconnect(); this._obs = null; } } catch (e) { /* noop */ }
+    },
+
+    /* QXBOT.pickAsset(): user clicks the real asset button once, we memorize it */
+    pickAsset() {
+      Log.push('PICK MODE: click the asset selector button on the page (20s window)…', 'warn');
+      const handler = ev => {
+        cleanup();
+        try { ev.preventDefault(); ev.stopPropagation(); } catch (e) { /* noop */ }
+        let el = ev.target;
+        if (el && el.closest && el.closest('#qxbot-root')) { Log.push('PICK cancelled — that is the bot panel', 'warn'); return; }
+        try { el = el.closest ? (el.closest('button, [role="button"], div, span') || el) : el; } catch (e) { /* noop */ }
+        if (!el) return;
+        const path = Util.cssPath(el);
+        this.taughtSel = path;
+        try { localStorage.setItem('qxbot_v1_assetSel', path); } catch (e) { /* noop */ }
+        /* v1.3: verify the learned selector actually resolves */
+        let ok = false;
+        try { ok = !!document.querySelector(path) && this.visible(document.querySelector(path)); } catch (e) { ok = false; }
+        Log.push('Asset button learned ✔ — stored for future sessions' + (ok ? ' (verified)' : ' (could not verify — try again if switching fails)'), ok ? 'ok' : 'warn');
+      };
+      const cleanup = () => {
+        document.removeEventListener('click', handler, true);
+        clearTimeout(this._pickT);
+      };
+      document.addEventListener('click', handler, true);
+      this._pickT = setTimeout(cleanup, 20000);
+    },
+
+    currentDisplay() {
+      const btn = this.findAssetButton();
+      if (!btn) return null;
+      return (btn.textContent || '').split('\n')[0].replace(/[+\-−]?\d{1,3}(?:[.,]\d+)?\s*%.*/, '').trim();
+    },
+
+    async switchTo(displayName) {
+      const opened = await this.openAssetList();
+      if (!opened) return false;
+      const key = Util.norm(displayName);
+      let target = null;
+      const all = document.querySelectorAll('div, li, span, button, a');
+      for (const el of all) {
+        const txt = (el.textContent || '').replace(/\s+/g, ' ').trim();
+        if (!txt || txt.length > 80) continue;
+        if (Util.pct(txt) === null) continue;
+        if (el.children.length > 4) continue;
+        if (Util.norm(txt.replace(/[+\-−]?\d{1,3}(?:[.,]\d+)?\s*%.*/, '')) === key) { target = el; break; }
+      }
+      if (!target) { await this.closeAssetList(); Log.push('Market row not found in list: ' + displayName, 'warn'); return false; }
+      Util.fireClick(target);
+      await Util.sleep(600);
+      await this.closeAssetList();
+      /* verify stream switched (or at least display changed) */
+      const disp = this.currentDisplay();
+      const ok = disp && Util.norm(disp).includes(key.slice(0, 8));
+      Log.push((ok ? 'Switched market → ' : 'Switch unsure → ') + displayName, ok ? 'ok' : 'warn');
+      if (ok && Store.lastStreamAsset) WS.requestHistory(Store.lastStreamAsset);
+      return true;
+    },
+
+    /* read payout % shown on the trade header near asset name */
+    headerPayout() {
+      const btn = this.findAssetButton();
+      if (!btn) return null;
+      return Util.pct(btn.textContent);
+    }
+  };
+
+  /* ── BALANCE TRACKER ────────────────────────────────────────────────── */
+  const Balance = {
+    value: null, isDemo: null, el: null,
+
+    set(v, demoGuess) {
+      if (v !== null && isFinite(v)) this.value = Number(v);
+      if (demoGuess !== undefined && demoGuess !== null) this.setDemo(!!demoGuess);
+    },
+    setDemo(b) {
+      if (this.isDemo !== b) {
+        this.isDemo = !!b;
+        Log.push('Account detected: ' + (b ? 'DEMO' : 'LIVE (real money!)'), b ? 'ok' : 'warn');
+      }
+    },
+    findEl() {
+      if (this.el && document.contains(this.el)) {
+        if (Util.parseBalance(this.el.textContent) !== null) return this.el;
+      }
+      const cands = document.querySelectorAll('[class*="balance" i], header span, header div, div[class*="account" i] span, div[class*="header"] span');
+      for (const el of cands) {
+        const txt = (el.textContent || '').trim();
+        const v = Util.parseBalance(txt);
+        if (v === null) continue;
+        const r = el.getBoundingClientRect();
+        if (r.width <= 0 || r.width > 260 || r.top > 140 || r.height > 60) continue;
+        this.el = el;
+        return el;
+      }
+      return null;
+    },
+    read(force) {
+      const el = this.findEl();
+      if (el) {
+        const v = Util.parseBalance(el.textContent);
+        if (v !== null) this.value = v;
+      }
+      return this.value;
+    }
+  };
+
+  /* ── TRADE EXECUTOR ─────────────────────────────────────────────────── */
+  const Exec = {
+
+    findAmountInput() {
+      const inputs = document.querySelectorAll('input');
+      for (const el of inputs) {
+        const ph = (el.placeholder || '').toLowerCase();
+        const cls = String(el.className || '').toLowerCase();
+        const near = el.closest('[class*="amount" i], [class*="trading" i], [class*="deal" i], [class*="payment" i], [class*="invest" i]');
+        if (/amount|bet|invest|sum/.test(ph) || /amount|invest/.test(cls) || near) {
+          const r = el.getBoundingClientRect();
+          if (r.width > 0) return el;
+        }
+      }
+      for (const el of inputs) {
+        const r = el.getBoundingClientRect();
+        if (r.top > window.innerHeight * 0.55 && r.width > 0 && /^\d*\.?\d*$/.test(el.value || '0')) return el;
+      }
+      return null;
+    },
+
+    setAmount(v) {
+      const el = this.findAmountInput();
+      if (!el) { Log.push('Amount input not found — set amount manually once', 'warn'); return false; }
+      try {
+        const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+        setter.call(el, String(v));
+        el.dispatchEvent(new Event('input', { bubbles: true }));
+        el.dispatchEvent(new Event('change', { bubbles: true }));
+        return true;
+      } catch (e) { return false; }
+    },
+
+    async setDuration(sec) {
+      const label = sec < 60 ? sec + 's' : (sec / 60) + 'm';
+      try {
+        const isOpt = el => {
+          const t = (el.textContent || '').trim();
+          return t === label && el.children.length <= 2 && el.getBoundingClientRect().width > 0;
+        };
+        let opts = [...document.querySelectorAll('div,li,span,button,a')].filter(isOpt);
+        if (!opts.length) {
+          const tEl = document.querySelector('[class*="time" i][class*="select" i], [class*="duration" i], [class*="expiry" i], [class*="time" i][class*="value" i], [class*="time" i][class*="label" i]');
+          if (tEl) {
+            tEl.click();
+            await Util.sleep(450);
+            opts = [...document.querySelectorAll('div,li,span,button,a')].filter(isOpt);
+          }
+        }
+        if (opts.length) {
+          opts[opts.length - 1].click();
+          await Util.sleep(200);
+          return true;
+        }
+      } catch (e) { /* noop */ }
+      Log.push('Duration "' + label + '" not found — set it manually once (bot remembers your UI choice too)', 'warn');
+      return false;
+    },
+
+    findTradeButtons() {
+      let call = document.querySelector('button[class*="call" i], a[class*="call" i], [class*="btn-call"], [data-test*="call" i], div[class*="call" i][class*="btn" i]');
+      let put = document.querySelector('button[class*="put" i], a[class*="put" i], [class*="btn-put"], [data-test*="put" i], div[class*="put" i][class*="btn" i]');
+      if (call && put) return { call, put };
+      /* color heuristic: big green / red clickable in bottom bar */
+      const els = document.querySelectorAll('button, a, div[role="button"]');
+      for (const el of els) {
+        const r = el.getBoundingClientRect();
+        if (r.width < 60 || r.height < 30 || r.top < window.innerHeight * 0.6) continue;
+        const bg = getComputedStyle(el).backgroundColor || '';
+        const m = bg.match(/(\d+),\s*(\d+),\s*(\d+)/);
+        if (!m) continue;
+        const R = +m[1], G = +m[2], B = +m[3];
+        if (!call && G > R + 30 && G > B + 30) call = el;
+        if (!put && R > G + 30 && R > B + 30) put = el;
+      }
+      return { call, put };
+    },
+
+    async place(dir, amount, sec) {
+      const asset = Store.lastStreamAsset || Scanner.currentDisplay() || '';
+      this.setAmount(amount);
+      await this.setDuration(sec);
+      const before = Balance.read(true);
+      const id = 'qxbot-' + Date.now();
+      let via = null;
+
+      if (CFG.orderMode !== 'dom') {
+        const frame = {
+          action: 'openOrder', asset: asset,
+          amount: Number(amount), command: dir,
+          isDemo: Balance.isDemo === false ? 0 : 1,
+          requestId: id, option: 'turbo', time: sec
+        };
+        const sent = WS.sendJSON(frame);
+        if (sent) {
+          via = 'ws';
+          const ack = await WS.awaitAck(id, 2800);
+          if (ack && (ack.success === false || ack.error)) {
+            Log.push('WS order rejected: ' + (ack.error || ack.msg || 'unknown'), 'err');
+            return { ok: false, via: 'ws-rejected' };
+          }
+          if (!ack) {
+            await Util.sleep(500);
+            const now2 = Balance.read(true);
+            const dropped = before !== null && now2 !== null && now2 <= before - amount * 0.5;
+            if (!dropped) { via = 'dom'; Log.push('WS no ack — fallback to buttons', 'warn'); }
+          }
+        } else {
+          via = 'dom';
+          Log.push('WS not available — using buttons', 'warn');
+        }
+      }
+
+      if (via === 'dom' || CFG.orderMode === 'dom') {
+        via = 'dom';
+        const btns = this.findTradeButtons();
+        const btn = dir === 'call' ? btns.call : btns.put;
+        if (!btn) {
+          Log.push('CALL/PUT buttons not found — open the trade panel once so buttons exist', 'err');
+          return { ok: false, via: 'dom' };
+        }
+        btn.click();
+      }
+
+      Log.push('Order sent via ' + via.toUpperCase() + ' | ' + dir.toUpperCase() + ' ' + Util.fmtMoney(amount) + ' ' + sec + 's', 'trade');
+      return { ok: true, via, before };
+    }
+  };
+
+  /* ── BOT: main loop / state machine ─────────────────────────────────── */
+  const Bot = {
+    running: false, phase: 'stopped', loopPromise: null,
+    marketIdx: 0, curMarket: null, curPayout: null, tradesThisMarket: 0,
+    sessionStart: null, lastTradeTs: 0, pauseUntil: 0,
+    warmStart: 0, historyAsked: false, lastTickTs: 0, lastSignal: null,
+    pendingOrder: null, lossStreak: 0, _headlessNoted: false,
+    mm: { step: 0 },
+    stats: { trades: 0, wins: 0, losses: 0, unknown: 0, pl: 0 },
+
+    start() {
+      if (this.running) return;
+      if (CFG.demoOnly && Balance.isDemo === false) {
+        Log.push('DEMO-ONLY guard: LIVE account detected — start blocked (uncheck Demo-only to override)', 'err');
+        return;
+      }
+      this.running = true;
+      this.phase = 'scan';
+      this.marketIdx = 0;
+      this.tradesThisMarket = 0;
+      this.mm.step = 0;
+      this._headlessNoted = false;
+      const bal = Balance.read(true);
+      this.sessionStart = bal !== null ? bal : null;
+      if (this.sessionStart === null) Log.push('Balance not found yet — session SL/TP activates once balance is read', 'warn');
+      else Log.push('Session start balance: ' + Util.fmtMoney(this.sessionStart), 'info');
+      this.loopPromise = this.loop();
+      Log.push('▶ BOT STARTED — strategy: ' + CFG.strategy.toUpperCase() + ' | TF: ' + CFG.tf + 's | expiry: ' + CFG.expiry + 's | MTG: ' + CFG.mtg.toUpperCase(), 'ok');
+    },
+
+    stop(reason) {
+      if (!this.running) return;
+      this.running = false;
+      this.phase = 'stopped';
+      Log.push('■ BOT STOPPED' + (reason ? ' — ' + reason : ''), 'warn');
+    },
+
+    setPhase(p) { this.phase = p; },
+
+    async loop() {
+      Log.push('Engine loop running');
+      while (this.running) {
+        try { await this.step(); } catch (e) { Log.push('loop error: ' + e.message, 'err'); }
+        await Util.sleep(document.hidden ? 3000 : 1000);   // battery saver when tab hidden
+      }
+      Log.push('Engine loop ended');
+    },
+
+    async step() {
+      const t = Util.now();
+      const bal = Balance.read();
+      const guard = Risk.check(bal, this.sessionStart, this.lossStreak, CFG);
+      if (guard.action === 'stop') { this.stop(guard.reason + ' | P/L: ' + Util.fmtMoney(bal - this.sessionStart)); return; }
+
+      switch (this.phase) {
+
+        case 'scan': {
+          /* v1.3: make sure the on-screen market is in the DB even with no asset button */
+          try { Scanner.seedCurrentMarket(); Scanner.harvestVisible(); } catch (e) { /* noop */ }
+          let q = PayoutDB.qualified(CFG.payoutMin, CFG.onlyOTC);
+          if (!q.length || t - Scanner.lastScanTs > 240) {
+            await Scanner.scanDOM(t - Scanner.lastScanTs > 240);
+            q = PayoutDB.qualified(CFG.payoutMin, CFG.onlyOTC);
+          }
+          if (q.length && Scanner.canSwitch()) {
+            if (this.marketIdx >= q.length) this.marketIdx = 0;
+            const pick = q[this.marketIdx];
+            this.curMarket = pick;
+            Log.push('Market ' + (this.marketIdx + 1) + '/' + q.length + ': ' + pick.display + ' @ ' + pick.payout + '%');
+            const sw = await Scanner.switchTo(pick.display);
+            if (!sw) { this.marketIdx++; return; }
+            this.warmStart = t;
+            this.historyAsked = false;
+            this.phase = 'warm';
+            break;
+          }
+          /* v1.3 HEADLESS MODE: no asset button → trade the market already on
+             screen via the WebSocket API (openOrder needs no DOM clicks). */
+          const cur = Store.lastStreamAsset;
+          const rec = cur ? PayoutDB.get(cur) : null;
+          if (cur && rec && rec.payout >= CFG.payoutMin && (!CFG.onlyOTC || rec.otc)) {
+            if (!this._headlessNoted) {
+              this._headlessNoted = true;
+              Log.push('HEADLESS MODE: asset button not found — trading the on-screen market ' + (rec.display || cur) + ' @ ' + rec.payout + '% via WebSocket (market rotation disabled)', 'warn');
+              Log.pushOnce('headless-how', 'Want market rotation? Open the asset list once manually, or run QXBOT.pickAsset() and click the asset button', 'info');
+            }
+            this.curMarket = rec;
+            this.marketIdx = 0;
+            this.warmStart = t;
+            this.historyAsked = false;
+            this.phase = 'warm';
+            break;
+          }
+          if (!cur) {
+            Log.pushOnce('nocur', 'No price stream yet — open/refresh the trading page fully so the market socket connects', 'warn');
+          } else if (rec && rec.payout < CFG.payoutMin) {
+            Log.pushOnce('lowpayout', 'On-screen market pays ' + rec.payout + '% (< ' + CFG.payoutMin + '% rule). Open the asset list once so the bot can rotate to ≥' + CFG.payoutMin + '% markets', 'warn');
+          } else {
+            Log.pushOnce('nopayout', 'On-screen market payout unknown — open the asset list once (rows auto-read) or run QXBOT.pickAsset()', 'warn');
+          }
+          break;
+        }
+
+        case 'warm': {
+          if (!this.historyAsked) {
+            this.historyAsked = true;
+            if (Store.lastStreamAsset) WS.requestHistory(Store.lastStreamAsset);
+          }
+          const asset = Store.lastStreamAsset;
+          const ticks = asset ? Store.getTicks(asset) : [];
+          const candles = Store.getCandles(asset, CFG.tf);
+          if (t - this.warmStart > CFG.warmTimeoutSec) {
+            Log.push('Market data too slow (' + ticks.length + ' ticks) — next market', 'warn');
+            this.marketIdx++;
+            this.phase = 'scan';
+            break;
+          }
+          if (ticks.length >= CFG.minTicks && Candles.ready(candles, CFG.minCandles)) {
+            Log.push('Data ready: ' + ticks.length + ' ticks, ' + candles.filter(c => c.n >= 2).length + ' x ' + CFG.tf + 's candles', 'ok');
+            this.phase = 'watch';
+          }
+          break;
+        }
+
+        case 'watch': {
+          const asset = Store.lastStreamAsset;
+          if (!asset) { this.phase = 'scan'; break; }
+
+          /* THE PAYOUT RULE: never trade below limit, rotate instead */
+          const hp = Scanner.headerPayout();
+          const dbP = PayoutDB.get(asset);
+          const payout = hp !== null ? hp : (dbP ? dbP.payout : null);
+          this.curPayout = payout;
+          if (payout !== null && payout < CFG.payoutMin) {
+            Log.push('Payout ' + payout + '% < ' + CFG.payoutMin + '% — NOT trading, rotating market', 'warn');
+            this.marketIdx++;
+            this.tradesThisMarket = 0;
+            this.phase = 'scan';
+            break;
+          }
+          if (Store.frozen(asset)) {
+            Log.push('Market frozen (' + CFG.frozenTicks + ' equal ticks) — rotating', 'warn');
+            this.marketIdx++;
+            this.phase = 'scan';
+            break;
+          }
+          if (t - this.lastTradeTs < CFG.cooldownSec) break;
+          if (this.pauseUntil && t < this.pauseUntil) break;
+
+          const candles = Store.getCandles(asset, CFG.tf);
+          if (!Candles.ready(candles, CFG.minCandles)) {
+            this.warmStart = t; this.historyAsked = false; this.phase = 'warm';
+            break;
+          }
+          const sig = Strategies.run(CFG.strategy, candles);
+          this.lastSignal = sig;
+          if (sig && sig.dir) {
+            Log.push('SIGNAL ' + sig.dir.toUpperCase() + ' | ' + sig.reason, 'trade');
+            await this.execute(sig.dir, asset);
+          }
+          break;
+        }
+
+        case 'trade':      /* awaiting result inside execute() */
+        case 'paused': {
+          if (this.phase === 'paused' && t >= this.pauseUntil) {
+            this.lossStreak = 0;
+            this.phase = 'watch';
+            Log.push('Pause over — trading resumed', 'ok');
+          }
+          break;
+        }
+      }
+    },
+
+    async execute(dir, asset) {
+      this.phase = 'trade';
+      const step = this.mm.step;
+      const amount = MM.nextAmount(CFG.mtg, CFG.amount, step);
+      Log.push('OPEN ' + dir.toUpperCase() + ' ' + Util.fmtMoney(amount) + ' | ' + CFG.expiry + 's' + (step ? ' | MTG step ' + step + ' (x' + Math.pow(2, step) + ' recovery)' : ''), 'trade');
+      const res = await Exec.place(dir, amount, CFG.expiry);
+      this.lastTradeTs = Util.now();
+      if (!res.ok) { this.phase = 'watch'; return; }
+
+      const order = { dir, amount, asset, openedTs: Util.now(), expiry: CFG.expiry, before: res.before, wsResult: null };
+      this.pendingOrder = order;
+      const r = await this.waitResult(order);
+      this.pendingOrder = null;
+      this.handleResult(r, order);
+    },
+
+    async waitResult(order) {
+      const deadline = order.openedTs + order.expiry + 10;
+      while (Util.now() < deadline) {
+        await Util.sleep(document.hidden ? 2500 : 1200);
+        if (order.wsResult) return order.wsResult;
+        const b = Balance.read(true);
+        if (b !== null && order.before !== null) {
+          const diff = b - order.before;
+          if (diff > order.amount * 0.4) return { win: true, diff };
+          if (diff < -order.amount * 0.4) return { win: false, diff };
+        }
+      }
+      return { win: null, diff: 0 };
+    },
+
+    onWsResult(msg) {
+      if (this.pendingOrder && !this.pendingOrder.wsResult) {
+        this.pendingOrder.wsResult = { win: msg.profit > 0, diff: Number(msg.profit) };
+        Log.push('WS result frame: profit ' + Util.fmtMoney(msg.profit), 'info');
+      }
+    },
+
+    handleResult(r, order) {
+      this.stats.trades++;
+      if (r.win === true) {
+        this.stats.wins++;
+        this.stats.pl = Util.round2(this.stats.pl + Math.abs(r.diff || order.amount * 0.8));
+        MM.onWin(this.mm);
+        this.lossStreak = 0;
+        Log.push('WIN ✔ +' + Util.fmtMoney(Math.abs(r.diff || 0)) + ' (balance ' + Util.fmtMoney(Balance.value) + ')', 'ok');
+      } else if (r.win === false) {
+        this.stats.losses++;
+        this.stats.pl = Util.round2(this.stats.pl - Math.abs(r.diff || order.amount));
+        MM.onLoss(this.mm, CFG.mtg);
+        this.lossStreak++;
+        Log.push('LOSS ✘ ' + Util.fmtMoney(-(Math.abs(r.diff || order.amount))) + ' | next amount ' + Util.fmtMoney(MM.nextAmount(CFG.mtg, CFG.amount, this.mm.step)), 'err');
+      } else {
+        this.stats.unknown++;
+        Log.push('Result unclear (balance not readable) — MTG step kept', 'warn');
+      }
+      this.tradesThisMarket++;
+
+      const bal = Balance.read();
+      const guard = Risk.check(bal, this.sessionStart, this.lossStreak, CFG);
+      if (guard.action === 'stop') { this.stop(guard.reason + ' | Session P/L: ' + Util.fmtMoney(this.stats.pl)); return; }
+      if (guard.action === 'pause') {
+        this.pauseUntil = Util.now() + CFG.pauseSec;
+        this.phase = 'paused';
+        Log.push('PAUSE ' + CFG.pauseSec + 's — ' + guard.reason, 'warn');
+        return;
+      }
+      if (r.win === false || this.tradesThisMarket >= CFG.tradesPerMarket) {
+        this.marketIdx++;
+        this.tradesThisMarket = 0;
+        this.phase = 'scan';
+        Log.push(r.win === false ? 'Rotating to next market after loss' : 'Rotating market (' + CFG.tradesPerMarket + ' trades done here)');
+      } else {
+        this.phase = 'watch';
+      }
+    },
+
+    status() {
+      return {
+        version: VERSION, running: this.running, phase: this.phase,
+        market: this.curMarket, payout: this.curPayout,
+        stats: this.stats, lossStreak: this.lossStreak,
+        mtgStep: this.mm.step, nextAmount: MM.nextAmount(CFG.mtg, CFG.amount, this.mm.step),
+        balance: Balance.value, isDemo: Balance.isDemo,
+        wsCaptured: WS.captured, ticks: Store.lastStreamAsset ? Store.getTicks(Store.lastStreamAsset).length : 0
+      };
+    }
+  };
+
+  /* ── SELF-TEST (engine tests run anywhere; env checks browser-only) ─── */
+  const SelfTest = {
+
+    mkCandles(closes) {
+      return closes.map((c, i) => ({
+        t: 1700000000 + i * 30,
+        o: i === 0 ? c : closes[i - 1],
+        h: Math.max(c, i === 0 ? c : closes[i - 1]),
+        l: Math.min(c, i === 0 ? c : closes[i - 1]),
+        c: c, n: 9
+      }));
+    },
+
+    async run() {
+      const R = [];
+      const T = (name, cond) => { R.push({ name, pass: !!cond }); Log.push((cond ? 'PASS ✔ ' : 'FAIL ✘ ') + name, cond ? 'ok' : 'err'); };
+
+      try {
+        /* RSI */
+        const down = [], up = [];
+        for (let i = 0; i < 40; i++) { down.push(100 - i); up.push(1 + i); }
+        const rs = Strategies.rsi(this.mkCandles(down));
+        const ru = Strategies.rsi(this.mkCandles(up));
+        T('RSI oversold → CALL', rs && rs.dir === 'call');
+        T('RSI overbought → PUT', ru && ru.dir === 'put');
+
+        /* Bollinger */
+        const flat = new Array(40).fill(100);
+        const bbDip = flat.slice(); bbDip[39] = 98.6;
+        const bb = Strategies.bollinger(this.mkCandles(bbDip));
+        T('Bollinger lower-band break → CALL', bb && bb.dir === 'call');
+
+        /* EMA cross */
+        const emaC = [];
+        for (let i = 0; i < 12; i++) emaC.push(102 - i);
+        emaC.push(112);
+        const em = Strategies.ema(this.mkCandles(emaC));
+        T('EMA 3/9 cross up → CALL', em && em.dir === 'call');
+
+        /* Stochastic (hand-built OHLC so %K/%D math is exact) */
+        const stC = [];
+        for (let i = 0; i < 13; i++) stC.push({ t: 1700000000 + i * 30, o: 99.8, h: 100, l: 99.5, c: 99.8, n: 9 });
+        const stSeq = [[95.5, 95.0, 95.1], [95.6, 95.1, 95.3], [95.9, 95.3, 95.6], [96.1, 95.7, 95.85], [96.3, 95.9, 96.05], [96.5, 96.1, 96.25]];
+        stSeq.forEach((v, k) => stC.push({ t: 1700000000 + (13 + k) * 30, o: v[0], h: v[0], l: v[1], c: v[2], n: 9 }));
+        const st = Strategies.stochastic(stC);
+        T('Stochastic low turn-up → CALL', st && st.dir === 'call');
+
+        /* Candle reversal */
+        const red4 = [];
+        for (let i = 0; i < 6; i++) red4.push(120 - i * 2);
+        const cr = Strategies.candleRev(this.mkCandles(red4));
+        T('4 red candles → CALL reversal', cr && cr.dir === 'call');
+
+        /* MACD flip — long flat market, single sharp crash candle */
+        const macC = new Array(42).fill(100);
+        macC[41] = 90;
+        const ms = Strategies.macdSig(this.mkCandles(macC));
+        T('MACD histogram flip down → PUT', ms && ms.dir === 'put');
+
+        /* Smart confluence — accelerating moves (band-break at the end) */
+        const accDown = [];
+        for (let i = 0; i < 36; i++) accDown.push(100 - i);
+        accDown.push(61, 57, 52, 48);
+        const accUp = [];
+        for (let i = 0; i < 36; i++) accUp.push(1 + i);
+        accUp.push(40, 44, 49, 55);
+        const sm = Strategies.smart(this.mkCandles(accDown));
+        T('SMART confluence strong downtrend → CALL', sm && sm.dir === 'call');
+        const sm2 = Strategies.smart(this.mkCandles(accUp));
+        T('SMART confluence strong uptrend → PUT', sm2 && sm2.dir === 'put');
+
+        /* Money management */
+        T('FLAT amounts 1/1/1', MM.nextAmount('none', 1, 0) === 1 && MM.nextAmount('none', 1, 1) === 1);
+        const m1 = { step: 0 }; MM.onLoss(m1, 'mtg1');
+        T('MTG1: 1 → 2', MM.nextAmount('mtg1', 1, m1.step) === 2);
+        MM.onLoss(m1, 'mtg1');
+        T('MTG1 exhausted → reset to 1', MM.nextAmount('mtg1', 1, m1.step) === 1);
+        const m2 = { step: 0 }; MM.onLoss(m2, 'mtg2'); const a1 = MM.nextAmount('mtg2', 1, m2.step);
+        MM.onLoss(m2, 'mtg2'); const a2 = MM.nextAmount('mtg2', 1, m2.step);
+        MM.onLoss(m2, 'mtg2'); const a3 = MM.nextAmount('mtg2', 1, m2.step);
+        T('MTG2 recovery: 1 → 2 → 4 → 1', a1 === 2 && a2 === 4 && a3 === 1);
+        MM.onWin(m2); T('Win resets MTG step', m2.step === 0);
+
+        /* Risk guard */
+        const g1 = Risk.check(84, 100, 0, CFG);
+        const g2 = Risk.check(96, 100, 3, CFG);
+        const g3 = Risk.check(100, 100, 6, CFG);
+        T('Risk: -15% session → STOP', g1.action === 'stop');
+        T('Risk: 3 losses → PAUSE', g2.action === 'pause');
+        T('Risk: 6 losses → STOP', g3.action === 'stop');
+
+        /* Candle bucketing from ticks */
+        const b = [];
+        Candles.addTick(b, 5, 1000, 1.100);
+        Candles.addTick(b, 5, 1003, 1.105);
+        Candles.addTick(b, 5, 1007, 1.102);
+        Candles.addTick(b, 5, 1012, 1.108);
+        Candles.addTick(b, 5, 1017, 1.104);
+        T('Ticks→candles: 4 buckets of 5s', b.length === 4);
+        T('Bucket OHLC correct',
+          b[0].o === 1.100 && b[0].h === 1.105 && b[0].l === 1.100 && b[0].c === 1.105 &&
+          b[1].o === 1.102 && b[2].o === 1.108 && b[3].o === 1.104 && b[3].c === 1.104);
+
+        /* Payout rule simulation */
+        PayoutDB.map.clear();
+        PayoutDB.setFromDOM('EUR/USD (OTC)', 92);
+        PayoutDB.setFromDOM('GBP/USD', 78);
+        PayoutDB.setFromDOM('AUD/CAD (OTC)', 85);
+        const q = PayoutDB.qualified(85, true);
+        T('Scanner filter: only OTC ≥85% (2 markets, sorted)', q.length === 2 && q[0].payout === 92 && q[1].payout === 85);
+        PayoutDB.map.clear();
+
+      } catch (e) {
+        Log.push('Engine test crashed: ' + e.message, 'err');
+        R.push({ name: 'engine suite', pass: false });
+      }
+
+      /* Environment checks — browser only (async: may auto-scan the page) */
+      if (typeof document !== 'undefined') {
+        /* page may still be mounting — poll for the asset button up to ~4s */
+        let btn = null;
+        try { btn = Scanner.findAssetButton(); } catch (e) { /* noop */ }
+        for (let i = 0; i < 8 && !btn; i++) {
+          await Util.sleep(500);
+          try { btn = Scanner.findAssetButton(); } catch (e) { /* noop */ }
+        }
+        /* no payout data yet? force a scan (opens + reads + closes the list) */
+        if (PayoutDB.size() < 3) {
+          Log.push('Payout DB empty — auto-scanning page + asset list…', 'warn');
+          try { await Scanner.scanDOM(true); } catch (e) { Log.push('Auto-scan failed: ' + e.message, 'err'); }
+        }
+        /* v1.3: even with no button, the on-screen market counts as tradeable */
+        try { Scanner.harvestVisible(true); Scanner.seedCurrentMarket(true); } catch (e) { /* noop */ }
+        T('ENV: WebSocket hook active', WS._patched === true);
+        T('ENV: broker socket captured', WS.captured === true && WS.sock !== null);
+        T('ENV: live frames received', WS.lastFrameTs > 0);
+        T('ENV: balance element found', Balance.read(true) !== null);
+        T('ENV: amount input found', Exec.findAmountInput() !== null);
+        const btns = Exec.findTradeButtons();
+        T('ENV: CALL/PUT buttons found', !!(btns.call && btns.put));
+        const btnFound = btn !== null || Scanner.findAssetButton() !== null;
+        const headlessOK = !btnFound && !!Store.lastStreamAsset && WS.captured === true;
+        T('ENV: asset button found (or headless WS mode)', btnFound || headlessOK);
+        T('ENV: payout DB has assets', PayoutDB.size() > 0);
+        if (headlessOK) {
+          Log.push('Headless mode available: no asset button, but WebSocket trading works on the on-screen market (v1.3)', 'info');
+          Log.pushOnce('headless-how', 'Want market rotation? Open the asset list once manually, or run QXBOT.pickAsset() and click the asset button', 'info');
+        }
+        const st = PayoutDB.stats();
+        const qualified = PayoutDB.qualified(CFG.payoutMin, CFG.onlyOTC).length;
+        Log.push('Payout DB: ' + st.total + ' assets, ' + st.otc + ' OTC' +
+          (st.best ? ', best OTC: ' + st.best.display + ' ' + st.best.payout + '%' : '') +
+          ' — qualified ≥' + CFG.payoutMin + '%: ' + qualified,
+          qualified ? 'ok' : (st.total ? 'warn' : 'err'));
+        if (!st.total) {
+          try {
+            Log.push('Diag: ' + WS._stats.text + ' text frames / ' + WS._stats.bin + ' binary frames, last ' + (WS.lastFrameTs ? Math.min(99, Util.now() - WS.lastFrameTs) + 's ago' : 'never'), 'warn');
+            const s1 = WS._frameLog.slice(-3).map(f => f.s).join(' | ');
+            if (s1) Log.push('Diag frames: ' + s1.slice(0, 190), 'warn');
+            Log.push('Diag: stream asset ' + (Store.lastStreamAsset || 'none') + ', visible chips ' + (Scanner.topChip() ? JSON.stringify(Scanner.topChip()) : 'none'), 'warn');
+          } catch (e) { /* noop */ }
+          Log.push('Fix: open the asset picker once (rows auto-read), or QXBOT.pickAsset(), or run QXBOT.debug() and send me the output', 'warn');
+        } else if (st.total && !qualified) Log.push('No market ≥' + CFG.payoutMin + '% right now — bot keeps scanning and will trade when one appears', 'warn');
+        const pass = R.filter(x => x.pass).length;
+        Log.push('SELF-TEST COMPLETE: ' + pass + '/' + R.length + ' passed', pass === R.length ? 'ok' : 'err');
+        return { pass, total: R.length };
+      }
+
+      const pass = R.filter(x => x.pass).length;
+      Log.push('Engine self-test: ' + pass + '/' + R.length + ' passed', pass === R.length ? 'ok' : 'err');
+      return { pass, total: R.length };
+    }
+  };
+
+  /* ── UI PANEL (dark neon, small, battery-friendly) ──────────────────── */
+  const UI = {
+    root: null, refs: {}, ticker: null, collapsed: false,
+    _last: {},
+
+    CSS: [
+      '#qxbot-root{position:fixed;z-index:2147483000;top:12px;right:12px;width:238px;font:11px/1.45 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;color:#cbd5e1;user-select:none;-webkit-user-select:none}',
+      '#qxbot-root *{box-sizing:border-box;margin:0;padding:0}',
+      '.qx-card{background:rgba(9,13,21,.95);border:1px solid #1d2939;border-radius:12px;overflow:hidden}',
+      '.qx-head{display:flex;align-items:center;gap:6px;padding:7px 9px;background:#0a0f17;cursor:move;border-bottom:1px solid #1d2939}',
+      '.qx-dot{width:8px;height:8px;border-radius:50%;background:#64748b;flex:0 0 8px}',
+      '.qx-title{font-weight:700;letter-spacing:.5px;color:#e2e8f0;font-size:11px}',
+      '.qx-chip{margin-left:auto;font-size:8.5px;padding:1px 6px;border-radius:8px;background:#101c2c;color:#38bdf8;font-weight:600}',
+      '.qx-chip.live{background:#2a1013;color:#f87171}',
+      '.qx-min{cursor:pointer;color:#64748b;padding:0 3px;font-size:13px;line-height:1}',
+      '.qx-min:hover{color:#94a3b8}',
+      '.qx-body{padding:8px 9px 9px}',
+      '.qx-row{display:flex;gap:6px;margin-bottom:6px}',
+      '.qx-field{flex:1;min-width:0}',
+      '.qx-label{font-size:8px;text-transform:uppercase;letter-spacing:.7px;color:#56657d;margin-bottom:2px;font-weight:700}',
+      '#qxbot-root select,#qxbot-root input{width:100%;background:#0d141f;border:1px solid #213049;color:#dbe4f0;border-radius:6px;padding:3px 5px;font-size:11px;outline:none}',
+      '#qxbot-root select:focus,#qxbot-root input:focus{border-color:#38bdf8}',
+      '.qx-btns{display:flex;gap:6px;margin:8px 0 7px}',
+      '.qx-btn{flex:1;text-align:center;padding:6px 0;border-radius:7px;font-weight:800;font-size:11px;cursor:pointer;border:none;letter-spacing:.4px}',
+      '.qx-start{background:#16a34a;color:#03130a}',
+      '.qx-stop{background:#dc2626;color:#fff}',
+      '.qx-mini{background:#15202f;color:#7dd3fc;flex:0 0 31%;font-size:9px;letter-spacing:.5px}',
+      '.qx-status{background:#0a1018;border:1px solid #18222f;border-radius:7px;padding:5px 7px;font-size:10px;margin-bottom:6px}',
+      '.qx-kv{display:flex;justify-content:space-between;gap:8px}',
+      '.qx-kv b{color:#e2e8f0;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:150px;display:inline-block}',
+      '.qx-kv span{color:#56657d;flex:0 0 auto}',
+      '.qx-sig{margin-top:3px;padding-top:3px;border-top:1px dashed #18222f;color:#7c8aa0;font-size:9px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}',
+      '.qx-stats{display:grid;grid-template-columns:repeat(3,1fr);gap:4px;margin-bottom:6px}',
+      '.qx-stat{background:#0a1018;border-radius:6px;padding:4px 3px;text-align:center;border:1px solid #121b27}',
+      '.qx-stat b{display:block;font-size:12px;color:#e2e8f0;font-weight:700}',
+      '.qx-stat span{font-size:7.5px;color:#56657d;text-transform:uppercase;letter-spacing:.5px;font-weight:700}',
+      '.qx-log{background:#060a10;border-radius:7px;padding:5px 7px;height:82px;overflow:hidden;font:9px/1.55 ui-monospace,SFMono-Regular,Menlo,monospace}',
+      '.qx-log div{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}',
+      '.qx-log .info{color:#7c8aa0}.qx-log .ok{color:#34d399}.qx-log .err{color:#f87171}.qx-log .warn{color:#fbbf24}.qx-log .trade{color:#38bdf8}',
+      '.qx-foot{display:flex;align-items:center;justify-content:space-between;margin-top:6px;font-size:8.5px;color:#4a5a72}',
+      '.qx-demoonly{cursor:pointer;border:1px solid #233046;border-radius:6px;padding:1px 6px;color:#34d399;font-weight:700;letter-spacing:.5px}',
+      '.qx-demoonly.off{color:#f87171;border-color:#3a1a1e}',
+      '.qx-bubble{width:44px;height:44px;border-radius:50%;background:rgba(9,13,21,.95);border:1px solid #1d2939;display:flex;align-items:center;justify-content:center;cursor:pointer;box-shadow:none}',
+      '.qx-bubble .qx-dot{width:10px;height:10px}'
+    ].join(''),
+
+    HTML: [
+      '<div class="qx-card">',
+      '  <div class="qx-head" id="qx-head">',
+      '    <div class="qx-dot" id="qx-dot"></div>',
+      '    <div class="qx-title">QX SMARTBOT</div>',
+      '    <div class="qx-chip" id="qx-acct">…</div>',
+      '    <div class="qx-min" id="qx-min">–</div>',
+      '  </div>',
+      '  <div class="qx-body" id="qx-body">',
+      '    <div class="qx-row">',
+      '      <div class="qx-field" style="flex:2"><div class="qx-label">Strategy</div><select id="qx-strategy">',
+      '        <option value="smart">★ SMART Confluence</option><option value="rsi">RSI Reversal</option><option value="bb">Bollinger Bands</option>',
+      '        <option value="ema">EMA 3/9 Cross</option><option value="stoch">Stochastic</option><option value="candle">Candle Reversal</option><option value="macd">MACD Flip</option>',
+      '      </select></div>',
+      '      <div class="qx-field"><div class="qx-label">Time</div><select id="qx-time">',
+      '        <option value="5">5s</option><option value="15">15s</option><option value="30" selected>30s</option><option value="60">1m</option>',
+      '      </select></div>',
+      '    </div>',
+      '    <div class="qx-row">',
+      '      <div class="qx-field"><div class="qx-label">MTG Recovery</div><select id="qx-mtg">',
+      '        <option value="none">OFF (flat)</option><option value="mtg1">MTG1 · x2 once</option><option value="mtg2">MTG2 · x2→x4</option>',
+      '      </select></div>',
+      '      <div class="qx-field"><div class="qx-label">Amount $</div><input id="qx-amount" type="number" min="1" step="1" value="1"></div>',
+      '      <div class="qx-field"><div class="qx-label">Min Pay %</div><input id="qx-payout" type="number" min="50" max="99" step="1" value="85"></div>',
+      '    </div>',
+      '    <div class="qx-btns">',
+      '      <button class="qx-btn qx-start" id="qx-start">▶ START</button>',
+      '      <button class="qx-btn qx-mini" id="qx-selftest">SELF-TEST</button>',
+      '      <button class="qx-btn qx-mini" id="qx-scan">SCAN</button>',
+      '    </div>',
+      '    <div class="qx-status">',
+      '      <div class="qx-kv"><span>Phase</span><b id="qx-phase">stopped</b></div>',
+      '      <div class="qx-kv"><span>Market</span><b id="qx-market">—</b></div>',
+      '      <div class="qx-kv"><span>Payout</span><b id="qx-payout-cur">—</b></div>',
+      '      <div class="qx-kv"><span>Balance</span><b id="qx-balance">—</b></div>',
+      '      <div class="qx-kv"><span>Next bet</span><b id="qx-next">1</b></div>',
+      '      <div class="qx-sig" id="qx-sig">waiting to start…</div>',
+      '    </div>',
+      '    <div class="qx-stats">',
+      '      <div class="qx-stat"><b id="qx-trades">0</b><span>Trades</span></div>',
+      '      <div class="qx-stat"><b id="qx-winrate">—</b><span>Winrate</span></div>',
+      '      <div class="qx-stat"><b id="qx-pl">$0.00</b><span>P / L</span></div>',
+      '      <div class="qx-stat"><b id="qx-wins" style="color:#34d399">0</b><span>Wins</span></div>',
+      '      <div class="qx-stat"><b id="qx-losses" style="color:#f87171">0</b><span>Losses</span></div>',
+      '      <div class="qx-stat"><b id="qx-streak">0</b><span>Streak</span></div>',
+      '    </div>',
+      '    <div class="qx-log" id="qx-log"></div>',
+      '    <div class="qx-foot"><div class="qx-demoonly" id="qx-demoonly">DEMO-ONLY ✔</div><div>v' + VERSION + ' · OTC scanner</div></div>',
+      '  </div>',
+      '</div>'
+    ].join(''),
+
+    PHASE_COLOR: { scan: '#f59e0b', warm: '#38bdf8', watch: '#22c55e', trade: '#a78bfa', paused: '#fb923c', stopped: '#64748b' },
+
+    build() {
+      if (document.getElementById('qxbot-root')) return;
+      const style = document.createElement('style');
+      style.id = 'qxbot-style';
+      style.textContent = this.CSS;
+      document.head.appendChild(style);
+
+      const root = document.createElement('div');
+      root.id = 'qxbot-root';
+      root.innerHTML = this.HTML;
+      document.body.appendChild(root);
+      this.root = root;
+
+      const $ = id => root.querySelector('#' + id);
+      this.refs = {
+        dot: $('qx-dot'), acct: $('qx-acct'), head: $('qx-head'), min: $('qx-min'), body: $('qx-body'),
+        strategy: $('qx-strategy'), time: $('qx-time'), mtg: $('qx-mtg'), amount: $('qx-amount'), payout: $('qx-payout'),
+        start: $('qx-start'), selftest: $('qx-selftest'), scan: $('qx-scan'),
+        phase: $('qx-phase'), market: $('qx-market'), payoutCur: $('qx-payout-cur'), balance: $('qx-balance'), next: $('qx-next'),
+        sig: $('qx-sig'), trades: $('qx-trades'), winrate: $('qx-winrate'), pl: $('qx-pl'),
+        wins: $('qx-wins'), losses: $('qx-losses'), streak: $('qx-streak'), log: $('qx-log'),
+        demoonly: $('qx-demoonly'), card: root.querySelector('.qx-card')
+      };
+
+      this.restorePos();
+      this.restoreSettings();
+      this.wire();
+      this.ticker = setInterval(() => { if (!document.hidden) this.refresh(); }, 1000);
+      globalThis.QXBOT._onLog = line => this.pushLog(line);
+      Log.ring.slice(-7).forEach(l => this.pushLog(l));
+      this.refresh(true);
+    },
+
+    wire() {
+      const r = this.refs;
+      r.min.addEventListener('click', e => { e.stopPropagation(); this.setCollapsed(!this.collapsed); });
+      r.start.addEventListener('click', () => { Bot.running ? Bot.stop('manual stop') : Bot.start(); this.refresh(true); });
+      r.selftest.addEventListener('click', () => SelfTest.run());
+      r.scan.addEventListener('click', () => Scanner.scanDOM(true));
+      r.strategy.addEventListener('change', () => { CFG.strategy = r.strategy.value; this.saveSettings(); Log.push('Strategy → ' + CFG.strategy.toUpperCase(), 'info'); });
+      r.time.addEventListener('change', () => { CFG.tf = parseInt(r.time.value, 10); CFG.expiry = CFG.tf; this.saveSettings(); Log.push('Timeframe & expiry → ' + CFG.tf + 's', 'info'); });
+      r.mtg.addEventListener('change', () => { CFG.mtg = r.mtg.value; Bot.mm.step = 0; this.saveSettings(); Log.push('Money management → ' + CFG.mtg.toUpperCase(), 'info'); });
+      r.amount.addEventListener('change', () => { CFG.amount = Math.max(0.5, parseFloat(r.amount.value) || 1); r.amount.value = CFG.amount; this.saveSettings(); });
+      r.payout.addEventListener('change', () => { CFG.payoutMin = Util.clamp(parseInt(r.payout.value, 10) || 85, 50, 99); r.payout.value = CFG.payoutMin; this.saveSettings(); Log.push('Min payout → ' + CFG.payoutMin + '%', 'info'); });
+      r.demoonly.addEventListener('click', () => {
+        CFG.demoOnly = !CFG.demoOnly;
+        r.demoonly.textContent = CFG.demoOnly ? 'DEMO-ONLY ✔' : 'DEMO-ONLY ✘';
+        r.demoonly.classList.toggle('off', !CFG.demoOnly);
+        Log.push('Demo-only guard ' + (CFG.demoOnly ? 'ON — live account blocked' : 'OFF — LIVE TRADING ENABLED, be careful!'), CFG.demoOnly ? 'ok' : 'warn');
+      });
+
+      /* drag */
+      let drag = null;
+      r.head.addEventListener('pointerdown', e => {
+        if (e.target === r.min) return;
+        const rect = this.root.getBoundingClientRect();
+        drag = { dx: e.clientX - rect.left, dy: e.clientY - rect.top };
+        r.head.setPointerCapture(e.pointerId);
+      });
+      r.head.addEventListener('pointermove', e => {
+        if (!drag) return;
+        const x = Util.clamp(e.clientX - drag.dx, 4, window.innerWidth - 60);
+        const y = Util.clamp(e.clientY - drag.dy, 4, window.innerHeight - 40);
+        this.root.style.left = x + 'px';
+        this.root.style.top = y + 'px';
+        this.root.style.right = 'auto';
+      });
+      r.head.addEventListener('pointerup', () => { drag = null; this.savePos(); });
+      r.head.addEventListener('dblclick', () => this.setCollapsed(!this.collapsed));
+    },
+
+    setCollapsed(v) {
+      this.collapsed = v;
+      const r = this.refs;
+      if (!r.card) return;
+      if (v) {
+        r.card.style.display = 'none';
+        const b = document.createElement('div');
+        b.className = 'qx-bubble';
+        b.id = 'qx-bubble';
+        b.innerHTML = '<div class="qx-dot"></div>';
+        b.title = 'QX SmartBot — click to open';
+        this.root.appendChild(b);
+        b.addEventListener('click', () => this.setCollapsed(false));
+        this.dotBubble = b;
+      } else {
+        if (this.dotBubble) { this.dotBubble.remove(); this.dotBubble = null; }
+        r.card.style.display = '';
+      }
+      try { localStorage.setItem('qxbot_v1_collapsed', v ? '1' : '0'); } catch (e) { /* noop */ }
+      this.refresh(true);
+    },
+
+    savePos() {
+      try { localStorage.setItem('qxbot_v1_pos', JSON.stringify({ left: this.root.style.left, top: this.root.style.top, right: this.root.style.right })); } catch (e) { /* noop */ }
+    },
+    restorePos() {
+      try {
+        const p = JSON.parse(localStorage.getItem('qxbot_v1_pos') || 'null');
+        if (p && (p.left || p.top)) { this.root.style.left = p.left || 'auto'; this.root.style.top = p.top || '12px'; this.root.style.right = p.right === 'auto' ? 'auto' : '12px'; }
+      } catch (e) { /* noop */ }
+      try { if (localStorage.getItem('qxbot_v1_collapsed') === '1') this.setCollapsed(true); } catch (e) { /* noop */ }
+    },
+
+    saveSettings() {
+      try {
+        localStorage.setItem('qxbot_v1_settings', JSON.stringify({
+          strategy: CFG.strategy, tf: CFG.tf, mtg: CFG.mtg, amount: CFG.amount, payoutMin: CFG.payoutMin
+        }));
+      } catch (e) { /* noop */ }
+    },
+    restoreSettings() {
+      try {
+        const s = JSON.parse(localStorage.getItem('qxbot_v1_settings') || 'null');
+        if (!s) return;
+        if (s.strategy) { CFG.strategy = s.strategy; this.refs.strategy.value = s.strategy; }
+        if (s.tf) { CFG.tf = s.tf; CFG.expiry = s.tf; this.refs.time.value = String(s.tf); }
+        if (s.mtg) { CFG.mtg = s.mtg; this.refs.mtg.value = s.mtg; }
+        if (s.amount) { CFG.amount = s.amount; this.refs.amount.value = s.amount; }
+        if (s.payoutMin) { CFG.payoutMin = s.payoutMin; this.refs.payout.value = s.payoutMin; }
+      } catch (e) { /* noop */ }
+    },
+
+    setTxt(el, v) {
+      if (!el || this._last[el.id] === v) return;
+      this._last[el.id] = v;
+      el.textContent = v;
+    },
+
+    pushLog(line) {
+      const box = this.refs.log;
+      if (!box) return;
+      const d = document.createElement('div');
+      d.className = line.lvl || 'info';
+      d.textContent = line.t + ' ' + line.msg;
+      box.appendChild(d);
+      while (box.children.length > 8) box.removeChild(box.firstChild);
+    },
+
+    refresh(force) {
+      const r = this.refs;
+      if (!r || !r.dot) return;
+      const st = Bot;
+      const col = this.PHASE_COLOR[st.phase] || '#64748b';
+      r.dot.style.background = col;
+      if (this.dotBubble) this.dotBubble.querySelector('.qx-dot').style.background = col;
+
+      this.setTxt(r.phase, st.phase.toUpperCase());
+      this.setTxt(r.market, st.curMarket ? st.curMarket.display : '—');
+      this.setTxt(r.payoutCur, st.curPayout !== null && st.curPayout !== undefined ? st.curPayout + '%' : '—');
+      this.setTxt(r.balance, Balance.value !== null ? Util.fmtMoney(Balance.value) : '—');
+      this.setTxt(r.next, Util.fmtMoney(MM.nextAmount(CFG.mtg, CFG.amount, st.mm.step)));
+
+      const s = st.stats;
+      const wr = s.trades ? Math.round((s.wins / s.trades) * 100) + '%' : '—';
+      this.setTxt(r.trades, String(s.trades));
+      this.setTxt(r.winrate, wr);
+      this.setTxt(r.pl, (s.pl >= 0 ? '+' : '') + Util.fmtMoney(s.pl));
+      r.pl.style.color = s.pl > 0 ? '#34d399' : s.pl < 0 ? '#f87171' : '#e2e8f0';
+      this.setTxt(r.wins, String(s.wins));
+      this.setTxt(r.losses, String(s.losses));
+      this.setTxt(r.streak, String(st.lossStreak));
+
+      const acct = Balance.isDemo === null ? '?' : Balance.isDemo ? 'DEMO' : 'LIVE!';
+      this.setTxt(r.acct, acct);
+      r.acct.className = 'qx-chip' + (acct === 'LIVE!' ? ' live' : '');
+
+      if (st.lastSignal && st.lastSignal.reason) {
+        const txt = (st.lastSignal.dir ? '↑ ' + st.lastSignal.dir.toUpperCase() + ' · ' : '· ') + st.lastSignal.reason;
+        this.setTxt(r.sig, txt);
+      }
+
+      if (force) {
+        r.start.textContent = st.running ? '■ STOP' : '▶ START';
+        r.start.className = 'qx-btn ' + (st.running ? 'qx-stop' : 'qx-start');
+      }
+    },
+
+    destroy() {
+      if (this.ticker) { clearInterval(this.ticker); this.ticker = null; }
+      if (globalThis.QXBOT) globalThis.QXBOT._onLog = null;
+      const st = document.getElementById('qxbot-style');
+      if (st) st.remove();
+      const rt = document.getElementById('qxbot-root');
+      if (rt) rt.remove();
+    }
+  };
+
+  /* ── TEARDOWN + BOOTSTRAP ───────────────────────────────────────────── */
+  const Teardown = {
+    destroy(why) {
+      try { Bot.stop('destroy' + (why ? ': ' + why : '')); } catch (e) { /* noop */ }
+      try { Scanner.disconnectObserver(); } catch (e) { /* noop */ }
+      try { WS.unpatchNet(); } catch (e) { /* noop */ }
+      try { UI.destroy(); } catch (e) { /* noop */ }
+      try { if (WS._OrigCtor) window.WebSocket = WS._OrigCtor; } catch (e) { /* noop */ }
+      try { if (WS._origSend) WebSocket.prototype.send = WS._origSend; } catch (e) { /* noop */ }
+      globalThis.QXBOT = null;
+      try { console.log('%c[QXBOT] destroyed' + (why ? ' (' + why + ')' : '') + ' — paste again to reinstall.', 'color:#f59e0b'); } catch (e) { /* noop */ }
+    }
+  };
+
+  const Boot = {
+    init() {
+      WS.patch();
+      WS.patchNet();
+      UI.build();
+      Scanner.observe();
+      setInterval(() => { if (!document.hidden) Balance.read(); }, 2000);
+      Log.push('QX SMARTBOT v' + VERSION + ' ready — demo account strongly recommended', 'ok');
+      Log.push('Tip: SELF-TEST first. SCAN forces a payout scan. Panel is draggable.', 'info');
+      Log.push('Waiting for broker socket… (price data starts flowing automatically)', 'info');
+    }
+  };
+
+  /* ── PUBLIC API ─────────────────────────────────────────────────────── */
+  const API = {
+    VERSION, CFG,
+    Util, Log, Engine, Strategies, Candles, MM, Risk,
+    Store, PayoutDB, WS, Scanner, Balance, Exec, Bot, UI, SelfTest,
+    start() { Bot.start(); },
+    stop() { Bot.stop('manual stop'); },
+    selfTest() { return SelfTest.run(); },
+    scanMarkets() { return Scanner.scanDOM(true); },
+    pickAsset() { return Scanner.pickAsset(); },
+
+    /* dump everything needed to diagnose env issues — paste the output back */
+    debug() {
+      const doc = typeof document !== 'undefined';
+      const cands = [];
+      if (doc) {
+        try {
+          const els = document.querySelectorAll('button, [role="button"], div, span, a, p, li');
+          for (const el of els) {
+            if (el.children.length > 4) continue;
+            const txt = Scanner.rowText(el);
+            if (!txt || txt.length > 48) continue;
+            if (!Util.pct(txt)) continue;
+            const r = el.getBoundingClientRect();
+            if (r.width <= 0) continue;
+            cands.push({ tag: el.tagName, cls: String((el.getAttribute && el.getAttribute('class')) || '').slice(0, 60), text: txt.slice(0, 48), top: Math.round(r.top), w: Math.round(r.width) });
+            if (cands.length >= 10) break;
+          }
+        } catch (e) { /* noop */ }
+      }
+      const btn = doc ? Scanner.findAssetButton() : null;
+      const out = {
+        version: VERSION,
+        url: typeof location !== 'undefined' ? location.href : null,
+        socket: WS.sock ? { url: WS.sock.url, binaryType: WS.sock.binaryType, state: WS.sock.readyState } : null,
+        lastFrameTs: WS.lastFrameTs,
+        frameStats: WS._stats,
+        binPending: WS._binPending.length,
+        lastStreamAsset: Store.lastStreamAsset,
+        headlessMode: !btn && !!Store.lastStreamAsset && WS.captured === true,
+        topChip: doc ? Scanner.topChip() : null,
+        balance: Balance.value, isDemo: Balance.isDemo,
+        payoutDB: PayoutDB.stats(),
+        countRows: doc ? Scanner.countRows() : null,
+        taughtSel: Scanner.taughtSel,
+        assetButton: btn ? { tag: btn.tagName, cls: String((btn.getAttribute && btn.getAttribute('class')) || '').slice(0, 60), text: (btn.textContent || '').slice(0, 60) } : null,
+        pctCandidates: cands,
+        framesIn: WS._frameLog.slice(-12),
+        framesOut: WS._sentLog.slice(-8)
+      };
+      try { console.log('%c[QXBOT DEBUG] copy this whole object:', 'color:#38bdf8;font-weight:bold', out); } catch (e) { /* noop */ }
+      Log.push('DEBUG dumped to console (F12) — copy the [QXBOT DEBUG] object', 'warn');
+      return out;
+    },
+    status() { return Bot.status(); },
+    destroy(why) { Teardown.destroy(why); },
+    _onLog: null
+  };
+  globalThis.QXBOT = API;
+
+  if (typeof window !== 'undefined' && typeof document !== 'undefined') {
+    Boot.init();
+  }
+})();
