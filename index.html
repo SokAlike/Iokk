@@ -1,0 +1,1088 @@
+/* ============================================================================
+ * QUOTEX OTC DEMO BOT v2.0  -  concurrent-safe win/lose tracking + MTG1/MTG2
+ * ----------------------------------------------------------------------------
+ * WHY YOUR OLD BOT SHOWED WRONG WIN/LOSE RESULTS (when several trades are open
+ * at the same time):
+ *   1) It kept ONE global "current trade" slot -> the newest trade overwrote
+ *      the pending result of the older one.
+ *   2) It checked the ACCOUNT BALANCE delta once -> the first payout got
+ *      credited to whichever trade checked next, the second check saw a
+ *      false LOSE (or a double-counted WIN).
+ *   3) It polled results BEFORE Quotex settled the trade (P/L still 0) ->
+ *      counted as a false LOSE.
+ *   4) The same trade was checked twice (no de-duplication by deal id).
+ *
+ * HOW v2.0 FIXES IT:
+ *   - EVERY trade is registered by its REAL deal id (from Quotex's own
+ *     "orders/open" WS ack + "orders/opened"/deals frames) into a registry.
+ *   - Each trade is settled INDIVIDUALLY, only after its own expiry + grace:
+ *       1) per-id profit frame / deals history  -> exact (WIN / LOSE / DRAW)
+ *       2) balance delta, ONLY if no other open trade overlaps this trade's
+ *          window -> safe fallback for single trades
+ *       3) otherwise -> UNKNOWN (never guessed, never misattributed)
+ *
+ * NEW: MTG1 / MTG2 = martingale recovery levels with SEPARATE win/lose stats.
+ *   BASE = normal trade (stake)        MTG1 = 1st recovery (stake x multi1)
+ *   MTG2 = 2nd recovery (stake x multi2). The HUD shows W/L/D/PnL/Win% for
+ *   BASE, MTG1, MTG2 (and EXT = external trades found by stake size).
+ *   Your own bot's trades and manual trades are AUTO-TRACKED too.
+ *
+ * PROTOCOL (verified from Quotex client sources):
+ *   WS send: 42["orders/open",{asset,amount,time,action,isDemo,tournamentId,
+ *            requestId,optionType}]        (optionType 100 = OTC timer mode)
+ *   WS recv: ["orders/open",{id,...}] ack, deals frames {id,profit,status},
+ *            balance frames {balance,is_demo,...}
+ *
+ * DEMO SAFETY: the engine refuses to open trades until a DEMO balance is
+ *   confirmed on the account (or you run BOT.confirmDemo() yourself).
+ *
+ * INSTALL: open your Quotex trade page (logged into DEMO), press F12 ->
+ *   Console -> paste this WHOLE file -> Enter. A panel appears top-right.
+ *
+ * QUICK START:
+ *   1) Wait 2-3s on the page (bot captures the live WebSocket).
+ *   2) BOT.selfTest()   -> verify the win/lose checker (5 tests, must PASS)
+ *   3) BOT.help()       -> all commands
+ *   4) BOT.start()      -> engine trades OTC signals automatically
+ *      ...or keep using YOUR bot: its trades are tracked automatically.
+ *   5) BOT.stats() / BOT.trades() / BOT.stop() / BOT.reset()
+ * ============================================================================ */
+(() => {
+'use strict';
+
+if (window.__QXBOT__) { console.warn('[QXBOT] already loaded - use the BOT.* commands.'); return; }
+
+/* ================================ CONFIG ================================ */
+const CONFIG = {
+  assets: ['EURUSD_otc'],            // OTC assets the engine may trade
+  expirySec: 60,                     // trade expiry in seconds
+  stake: 1,                          // BASE trade stake
+  mtg: {
+    enabled: true,
+    multi1: 2.2,                     // MTG1 stake = stake * 2.2
+    multi2: 4.8,                     // MTG2 stake = stake * 4.8
+    maxLevel: 2,                     // BASE -> MTG1 -> MTG2 -> back to BASE
+    onDraw: 'repeat'                 // 'repeat' same level | 'reset' to BASE
+  },
+  maxConcurrent: 2,                  // max simultaneous open trades (engine)
+  dailyLossStop: 50,                 // stop engine when session P/L <= -50
+  dailyProfitGoal: 0,                // 0 = disabled
+  onlyOtc: true,                     // engine only trades *_otc assets
+  onlyDemo: true,                    // refuse to trade unless demo confirmed
+  signal: {
+    rsiLen: 14, rsiLow: 35, rsiHigh: 65,   // RSI mean-reversion thresholds
+    emaFast: 9, emaSlow: 21,               // EMA trend filter
+    cooldownSec: 20                        // min seconds between trades/asset
+  },
+  pollMs: 1000,                      // settlement loop interval
+  settleGraceMs: 5000,               // wait after expiry before resolving
+  unknownAfterRetries: 45,           // ~45s after grace -> UNKNOWN (no guess)
+  logLevel: 'info'                   // 'debug' = more detail
+};
+
+/* ================================ STATE ================================= */
+const S = {
+  running: false,
+  balance: null,
+  balanceIsDemo: null,
+  lastBalanceAt: 0,
+  demoConfirmed: false,
+  trades: new Map(),          // id -> trade record (THE FIX: per-id registry)
+  pendingResults: new Map(),  // id -> {profit, at}   latest profit frame/id
+  intents: new Map(),         // requestId -> outgoing order intent
+  seq: 0,
+  nextLevel: 'BASE',          // pending martingale level for next engine trade
+  cycleBaseStake: CONFIG.stake,
+  stats: null,
+  templates: {},              // learned Quotex payloads: BUY / BALANCE / CANDLES / HISTORY
+  debugRing: [],
+  sockets: new Set(),
+  todayPnl: 0,
+  lastTradeAtByAsset: new Map(),
+  startedAt: Date.now(),
+  _warnOnce: {}
+};
+function emptyStats() {
+  return { BASE: { w: 0, l: 0, d: 0, pnl: 0 }, MTG1: { w: 0, l: 0, d: 0, pnl: 0 },
+           MTG2: { w: 0, l: 0, d: 0, pnl: 0 }, EXT: { w: 0, l: 0, d: 0, pnl: 0 },
+           UNKNOWN: { w: 0, l: 0, d: 0, pnl: 0 } };
+}
+S.stats = emptyStats();
+
+/* ================================ UTILS ================================= */
+const round2 = v => Math.round((Number(v) || 0) * 100) / 100;
+const fmt = v => ((Number(v) || 0) < 0 ? '-$' : '$') + Math.abs(round2(v)).toFixed(2);
+const DIRWORDS = { call: 'CALL', up: 'CALL', buy: 'CALL', higher: 'CALL', above: 'CALL',
+                   put: 'PUT', down: 'PUT', sell: 'PUT', lower: 'PUT', below: 'PUT' };
+const PROFIT_KEY = /^(profit|pnl|profit_amount|win_amount|profit_value|payout_value)$/i;
+const ID_KEY = /^(id|_id|order_id|deal_id|trade_id)$/i;
+const TAG = '%c QXBOT ';
+const TAGCSS = 'background:#6c5ce7;color:#fff;border-radius:3px;font-weight:700;padding:1px 4px';
+function log(level, ...args) {
+  if (level === 'debug' && CONFIG.logLevel !== 'debug') return;
+  const css = level === 'error' ? 'background:#b91c1c;color:#fff;border-radius:3px;font-weight:700;padding:1px 4px'
+    : level === 'warn' ? 'background:#b45309;color:#fff;border-radius:3px;font-weight:700;padding:1px 4px' : TAGCSS;
+  console.log(level === 'info' ? TAG : '%c QXBOT ', css, ...args);
+}
+function warnOnce(key, ...args) { if (S._warnOnce[key]) return; S._warnOnce[key] = true; log('warn', ...args); }
+function ringPush(o) { S.debugRing.push(o); if (S.debugRing.length > 150) S.debugRing.shift(); }
+
+function parseWSFrame(txt) {
+  // Quotex frames: 42["channel",{..}] | 451-["channel",{..}] | plain JSON
+  const i = txt.search(/[\[{]/);
+  if (i < 0) return null;
+  let data = null;
+  try { data = JSON.parse(txt.slice(i)); } catch (e) { return null; }
+  let channel = null;
+  if (Array.isArray(data) && data.length >= 1 && typeof data[0] === 'string') channel = data[0];
+  return { channel, data };
+}
+function framePayload(p) {
+  if (p.channel != null && Array.isArray(p.data)) return p.data.length >= 2 ? p.data[1] : (p.data[0] || null);
+  return p.data;
+}
+function normalizeDir(v) {
+  if (v == null) return 'CALL';
+  const d = DIRWORDS[String(v).toLowerCase()];
+  if (d) return d;
+  if (v === 1 || v === true) return 'CALL';
+  if (v === 0 || v === false) return 'PUT';
+  return 'CALL';
+}
+function extractId(data) {
+  let id = null;
+  (function walk(n, d) {
+    if (id != null || d > 5 || n == null || typeof n !== 'object') return;
+    if (Array.isArray(n)) { for (const it of n) walk(it, d + 1); return; }
+    for (const k of Object.keys(n)) {
+      if (ID_KEY.test(k)) {
+        const v = n[k];
+        if ((typeof v === 'number' && v > 0) || (typeof v === 'string' && v.length >= 3)) { id = v; return; }
+      }
+      const v2 = n[k];
+      if (v2 && typeof v2 === 'object') walk(v2, d + 1);
+    }
+  })(data, 0);
+  return id;
+}
+function deepScanResults(n, hits, d) {
+  // objects that carry a deal id AND a numeric profit -> result candidates
+  if (d > 8 || n == null || typeof n !== 'object') return;
+  if (Array.isArray(n)) { for (const it of n) deepScanResults(it, hits, d + 1); return; }
+  const keys = Object.keys(n);
+  const ik = keys.find(k => ID_KEY.test(k));
+  const pk = keys.find(k => PROFIT_KEY.test(k));
+  if (ik && pk && typeof n[pk] === 'number') hits.push(n);
+  for (const k of keys) { const v = n[k]; if (v && typeof v === 'object') deepScanResults(v, hits, d + 1); }
+}
+function deepScanOpens(n, hits, d) {
+  // objects that carry a deal id + asset but NO profit -> open confirmations
+  if (d > 8 || n == null || typeof n !== 'object') return;
+  if (Array.isArray(n)) { for (const it of n) deepScanOpens(it, hits, d + 1); return; }
+  const keys = Object.keys(n);
+  const ik = keys.find(k => ID_KEY.test(k));
+  const pk = keys.find(k => PROFIT_KEY.test(k));
+  const closed = keys.some(k => /^(status|state|game_state)$/i.test(k) && /clos/i.test(String(n[k])));
+  if (ik && typeof n.asset === 'string' && !pk && !closed) hits.push(n);
+  for (const k of keys) { const v = n[k]; if (v && typeof v === 'object') deepScanOpens(v, hits, d + 1); }
+}
+function findBalance(data) {
+  let found = null;
+  (function walk(n, d) {
+    if (found || d > 6 || n == null || typeof n !== 'object') return;
+    if (Array.isArray(n)) { for (const it of n) walk(it, d + 1); return; }
+    for (const k of Object.keys(n)) {
+      if (/^(balance|demo_balance|real_balance)$/i.test(k) && typeof n[k] === 'number') {
+        let isDemo = S.balanceIsDemo;
+        if (n.is_demo != null) isDemo = !!n.is_demo;
+        else if (n.isDemo != null) isDemo = !!n.isDemo;
+        else if (k === 'demo_balance') isDemo = true;
+        else if (k === 'real_balance') isDemo = false;
+        found = { value: n[k], isDemo };
+        return;
+      }
+      const v = n[k];
+      if (v && typeof v === 'object') walk(v, d + 1);
+    }
+  })(data, 0);
+  return found;
+}
+function guessLevelByStake(amount) {
+  const a = round2(amount);
+  if (Math.abs(a - round2(CONFIG.stake)) < 0.005) return 'BASE';
+  if (Math.abs(a - round2(CONFIG.stake * CONFIG.mtg.multi1)) < 0.005) return 'MTG1';
+  if (Math.abs(a - round2(CONFIG.stake * CONFIG.mtg.multi2)) < 0.005) return 'MTG2';
+  return 'EXT';
+}
+function calcExpiration(durationSec) {
+  // Quotex needs an absolute expiry epoch, aligned to the duration grid
+  const dur = Number(durationSec) || 60;
+  const nowSec = Math.floor(Date.now() / 1000);
+  if (dur < 60) {
+    const sec = new Date().getSeconds();
+    const shift = sec >= 30 ? 1 : 0;
+    return nowSec - (nowSec % 60) + (shift + 1) * 60;
+  }
+  const midnight = new Date(); midnight.setHours(0, 0, 0, 0);
+  const midSec = Math.floor(midnight.getTime() / 1000);
+  const ssm = nowSec - midSec;
+  const rem = ssm % dur;
+  const step = rem > (dur / 2) ? 2 : 1;
+  return midSec + (Math.floor(ssm / dur) + step) * dur;
+}
+
+/* ========================= NETWORK BRIDGE ===============================
+ * Watches the page's own WebSocket + fetch/XHR traffic (read-only).
+ * Learns Quotex's real order payload from any outgoing "orders/open" frame
+ * (manual click, your old bot, or this engine) - nothing is hard-coded.
+ * ======================================================================== */
+const Bridge = {
+  installed: false,
+  origFetch: (typeof fetch === 'function') ? fetch.bind(window) : null,
+
+  install() {
+    if (this.installed) return;
+    this.installed = true;
+    try { this.hookFetch(); } catch (e) {}
+    try { this.hookXHR(); } catch (e) {}
+    try { this.hookWS(); } catch (e) {}
+    log('info', 'Network bridge installed (WebSocket / fetch / XHR). Waiting for live frames...');
+  },
+
+  hookFetch() {
+    const orig = this.origFetch;
+    if (!orig) return;
+    window.fetch = function (input, init) {
+      let url = '', method = 'GET', reqHeaders = {}, body = null;
+      try {
+        if (typeof input === 'string') url = input;
+        else if (input && input.url) { url = input.url; method = String(input.method || 'GET').toUpperCase(); }
+        if (init) {
+          if (init.method) method = String(init.method).toUpperCase();
+          if (init.body && typeof init.body === 'string') body = init.body;
+          collectHeaders(init.headers, reqHeaders);
+        }
+        if (input && input.headers) collectHeaders(input.headers, reqHeaders);
+      } catch (e) {}
+      const interesting = /order|history|deal|balance|buy|sell|option|trade|candle|asset|prof/i.test(url);
+      const p = orig.apply(this, arguments);
+      if (interesting) {
+        p.then(res => {
+          try {
+            const len = +(res.headers.get('content-length') || 0);
+            if (len > 300000) return;
+            res.clone().text().then(txt => Bridge.ingest({ src: 'fetch', method, url, reqHeaders, body, status: res.status, text: txt })).catch(() => {});
+          } catch (e) {}
+        }).catch(() => {});
+      }
+      return p;
+    };
+  },
+
+  hookXHR() {
+    const O = XMLHttpRequest.prototype;
+    if (O.__qxHooked) return;
+    O.__qxHooked = true;
+    const oOpen = O.open, oSend = O.send, oHdr = O.setRequestHeader;
+    O.open = function (m, u) { try { this.__qxMeta = { method: String(m || '').toUpperCase(), url: String(u || ''), headers: {}, body: null }; } catch (e) {} return oOpen.apply(this, arguments); };
+    O.setRequestHeader = function (k, v) { try { if (this.__qxMeta) this.__qxMeta.headers[String(k).toLowerCase()] = String(v); } catch (e) {} return oHdr.apply(this, arguments); };
+    O.send = function (b) {
+      try { if (this.__qxMeta && typeof b === 'string') this.__qxMeta.body = b; } catch (e) {}
+      this.addEventListener('readystatechange', () => {
+        try {
+          const m = this.__qxMeta;
+          if (!m || this.readyState !== 4) return;
+          if (this.responseType && this.responseType !== 'text') return;
+          if (!/order|history|deal|balance|buy|sell|option|trade|candle|asset|prof/i.test(m.url)) return;
+          Bridge.ingest({ src: 'xhr', method: m.method, url: m.url, reqHeaders: m.headers, body: m.body, status: this.status, text: this.responseText });
+        } catch (e) {}
+      });
+      return oSend.apply(this, arguments);
+    };
+  },
+
+  hookWS() {
+    const Native = window.WebSocket;
+    if (!Native || Native.__qxHooked) return;
+    Native.__qxHooked = true;
+    const oSend = Native.prototype.send;
+    Native.prototype.send = function (data) {
+      if (!this.__qxHooked) { this.__qxHooked = true; try { Bridge.attachSocket(this); } catch (e) {} }
+      try { if (typeof data === 'string' && data.indexOf('orders/open') >= 0) Bridge.ingest({ src: 'ws-out', method: 'WS', url: 'ws-send', reqHeaders: {}, body: null, status: 0, text: data }); } catch (e) {}
+      return oSend.apply(this, arguments);
+    };
+    const Wrapper = function (url, protocols) {
+      const ws = protocols === undefined ? new Native(url) : new Native(url, protocols);
+      try { Bridge.attachSocket(ws); } catch (e) {}
+      return ws;
+    };
+    Wrapper.prototype = Native.prototype;
+    Wrapper.CONNECTING = 0; Wrapper.OPEN = 1; Wrapper.CLOSING = 2; Wrapper.CLOSED = 3;
+    try { window.WebSocket = Wrapper; } catch (e) {}
+  },
+
+  attachSocket(ws) {
+    S.sockets.add(ws);
+    ws.addEventListener('message', ev => { try { Bridge.onWSData(ev.data); } catch (e) {} });
+    ws.addEventListener('close', () => S.sockets.delete(ws));
+    log('debug', 'WebSocket captured:', ws.url || '(live socket)');
+  },
+
+  onWSData(data) {
+    try {
+      const mk = t => ({ src: 'ws', method: 'WS', url: 'websocket', reqHeaders: {}, body: null, status: 0, text: t });
+      if (typeof data === 'string') return this.ingest(mk(data));
+      if (data && typeof data.text === 'function') { data.text().then(t => Bridge.ingest(mk(t))).catch(() => {}); return; }
+      if (data instanceof ArrayBuffer) return this.ingest(mk(new TextDecoder().decode(data)));
+    } catch (e) {}
+  },
+
+  ingest(f) {
+    try {
+      if (!f || typeof f.text !== 'string' || f.text.length < 2) return;
+      const isNet = (f.src === 'fetch' || f.src === 'xhr');
+      if (isNet) this.learnREST(f);
+      if (f.src === 'ws-out') { this.onWSOutgoingFrame(f.text); return; }
+      const p = parseWSFrame(f.text);
+      if (!p) return;
+      const payload = framePayload(p);
+      if (p.channel === 'orders/open' && payload && typeof payload === 'object' && !Array.isArray(payload)) {
+        this.onBuyAck(payload);
+      }
+      if (payload == null) return;
+      if (!p.channel || !/history|trader|instruments/i.test(p.channel)) {
+        const opens = [];
+        deepScanOpens(payload, opens, 0);
+        for (const o of opens) Tracker.registerOpen(o);
+      }
+      const hits = [];
+      deepScanResults(payload, hits, 0);
+      for (const h of hits) Tracker.onResultCandidate(h);
+      const bal = findBalance(payload);
+      if (bal) {
+        S.balance = bal.value;
+        if (bal.isDemo != null) S.balanceIsDemo = bal.isDemo;
+        if (S.balanceIsDemo === true) S.demoConfirmed = true;
+        S.lastBalanceAt = Date.now();
+      }
+      ringPush({ t: Date.now(), src: f.src, ch: p.channel || '-', head: String(f.text).slice(0, 140) });
+    } catch (e) {}
+  },
+
+  /* outgoing 42["orders/open",{...}] frames: learn template + record intent */
+  onWSOutgoingFrame(txt) {
+    try {
+      const p = parseWSFrame(txt);
+      if (!p || p.channel !== 'orders/open') return;
+      const payload = framePayload(p);
+      if (!payload || typeof payload !== 'object') return;
+      if (!S.templates.BUY) {
+        S.templates.BUY = Object.assign({}, payload);
+        log('info', 'BUY API learned from outgoing order (WS orders/open). Engine ready.');
+      }
+      const rid = payload.requestId != null ? String(payload.requestId) : (payload.request_id != null ? String(payload.request_id) : null);
+      if (rid && S.intents.has(rid)) return; // our own engine send
+      const intent = {
+        requestId: rid || ('ext-' + (++S.seq)),
+        asset: payload.asset, amount: Number(payload.amount) || 0,
+        dir: normalizeDir(payload.action),
+        expirySec: payload.time ? Math.max(5, Math.round(payload.time - Date.now() / 1000)) : CONFIG.expirySec,
+        expiresAt: payload.time ? payload.time * 1000 : Date.now() + CONFIG.expirySec * 1000,
+        sentAt: Date.now(), level: undefined
+      };
+      S.intents.set(String(intent.requestId), intent);
+      setTimeout(() => { if (S.intents.get(String(intent.requestId)) === intent) S.intents.delete(String(intent.requestId)); }, 30000);
+      log('debug', 'external order intent captured (requestId=' + intent.requestId + ')');
+    } catch (e) {}
+  },
+
+  /* ack frame for orders/open -> register the trade with its REAL deal id */
+  onBuyAck(payload) {
+    try {
+      if (!payload || typeof payload !== 'object') return;
+      const rid = payload.requestId != null ? String(payload.requestId) : (payload.request_id != null ? String(payload.request_id) : null);
+      let intent = null;
+      if (rid && S.intents.has(rid)) { intent = S.intents.get(rid); S.intents.delete(rid); }
+      else if (S.intents.size) {
+        let bestK = null, bestV = null;
+        for (const [k, v] of S.intents) if (Date.now() - v.sentAt < 30000 && (!bestV || v.sentAt < bestV.sentAt)) { bestK = k; bestV = v; }
+        if (bestK != null) { intent = bestV; S.intents.delete(bestK); }
+      }
+      const id = extractId(payload);
+      if (id == null) {
+        if (intent) log('error', 'order REJECTED (' + intent.asset + ' ' + fmt(intent.amount) + '): ' + JSON.stringify(payload).slice(0, 150));
+        return;
+      }
+      Tracker.register({
+        id,
+        asset: intent ? intent.asset : (typeof payload.asset === 'string' ? payload.asset : '?'),
+        amount: intent ? intent.amount : (Number(payload.amount) || 0),
+        dir: intent ? intent.dir : normalizeDir(payload.action),
+        expirySec: intent ? intent.expirySec : CONFIG.expirySec,
+        openedAt: intent ? intent.sentAt : Date.now(),
+        expiresAt: intent ? intent.expiresAt : undefined,
+        level: intent ? intent.level : undefined,
+        via: intent ? 'engine' : 'external'
+      });
+    } catch (e) {}
+  },
+
+  learnREST(f) {
+    const url = String(f.url || '');
+    const bodyObj = parseBody(f.body);
+    if (!S.templates.REST_BUY && bodyObj && typeof bodyObj.asset === 'string' &&
+        (bodyObj.option_type != null || bodyObj.optionType != null || /order\.open|\/buy/i.test(url))) {
+      S.templates.REST_BUY = { url, method: f.method || 'POST', headers: cleanHeaders(f.reqHeaders), body: bodyObj };
+      log('info', 'REST order API noted:', url);
+    }
+    if (!S.templates.BALANCE && f.status === 200 && /balance/i.test(url)) {
+      S.templates.BALANCE = { url, method: f.method || 'POST', headers: cleanHeaders(f.reqHeaders), body: bodyObj };
+    }
+    if (!S.templates.CANDLES && /candle/i.test(url)) {
+      S.templates.CANDLES = { url, method: f.method || 'POST', headers: cleanHeaders(f.reqHeaders), body: bodyObj };
+    }
+    if (!S.templates.HISTORY && f.status === 200 && /history|deal|closed|profit/i.test(url)) {
+      S.templates.HISTORY = { url, method: f.method || 'POST', headers: cleanHeaders(f.reqHeaders), body: bodyObj };
+    }
+  },
+
+  async raw(url, opts = {}) { return this.origFetch(url, Object.assign({ credentials: 'include' }, opts)); },
+
+  /* Open a trade through the page's own live WebSocket (demo-locked) */
+  buy(asset, amount, dir, expirySec, tag) {
+    if (CONFIG.onlyDemo && !S.demoConfirmed) throw new Error('DEMO not confirmed - run BOT.confirmDemo() if this IS your demo account.');
+    let ws = null;
+    for (const s of S.sockets) if (s.readyState === 1) { ws = s; break; }
+    if (!ws) throw new Error('No live WebSocket yet - wait 2-3s on the trade page (or make one manual trade).');
+    const payload = Object.assign({}, S.templates.BUY || {});
+    payload.asset = asset;
+    payload.amount = Number(amount);
+    payload.time = calcExpiration(expirySec);
+    payload.action = (dir === 'PUT') ? 'put' : 'call';
+    payload.isDemo = CONFIG.onlyDemo ? 1 : (payload.isDemo != null ? payload.isDemo : 1);
+    payload.requestId = Date.now();
+    if (payload.optionType == null) payload.optionType = 100; // 100 = OTC timer mode
+    const rid = String(payload.requestId);
+    S.intents.set(rid, { requestId: rid, asset, amount, dir, expirySec, expiresAt: payload.time * 1000, sentAt: Date.now(), level: tag || undefined });
+    ws.send('42["orders/open",' + JSON.stringify(payload) + ']');
+    log('info', 'OPEN> ' + (tag || S.nextLevel) + ' ' + dir + ' ' + asset + ' ' + fmt(amount) +
+                '  exp ' + new Date(payload.time * 1000).toLocaleTimeString() + '  (requestId ' + rid + ')');
+    setTimeout(() => {
+      if (S.intents.get(rid)) { S.intents.delete(rid); log('error', 'No ack for requestId ' + rid + ' - order was likely rejected.'); }
+    }, 10000);
+  },
+
+  async pullHistory(force) {
+    const t = S.templates.HISTORY;
+    if (!t) return;
+    const now = Date.now();
+    if (!force && now - (this._pullAt || 0) < 5000) return;
+    this._pullAt = now;
+    try {
+      const body = t.body ? Object.assign({}, t.body) : null;
+      if (body) for (const k of Object.keys(body)) if (/limit|count|page|offset/i.test(k)) body[k] = 50;
+      const res = await this.raw(t.url, { method: t.method || 'POST', headers: t.headers, body: body ? JSON.stringify(body) : undefined });
+      const txt = await res.text();
+      this.ingest({ src: 'pull', method: t.method, url: t.url, reqHeaders: t.headers, body: body ? JSON.stringify(body) : null, status: res.status, text: txt });
+    } catch (e) {}
+  },
+
+  async probeBalance() {
+    const t = S.templates.BALANCE;
+    if (!t) return;
+    try {
+      const res = await this.raw(t.url, { method: t.method || 'POST', headers: t.headers, body: t.body ? JSON.stringify(t.body) : undefined });
+      const txt = await res.text();
+      this.ingest({ src: 'pull', method: t.method, url: t.url, reqHeaders: t.headers, body: null, status: res.status, text: txt });
+    } catch (e) {}
+  }
+};
+
+/* ========================= RESULT TRACKER (THE FIX) =====================
+ * Every trade lives in S.trades keyed by its REAL deal id. Settlement is
+ * per-trade, after that trade's own expiry, and never guesses.
+ * ======================================================================== */
+function parseBody(b) {
+  if (!b || typeof b !== 'string') return null;
+  try { const o = JSON.parse(b); return (o && typeof o === 'object') ? o : null; } catch (e) {}
+  try { const p = new URLSearchParams(b); const o = {}; for (const [k, v] of p) o[k] = v; return Object.keys(o).length ? o : null; } catch (e) {}
+  return null;
+}
+function collectHeaders(h, out) {
+  try {
+    if (!h) return;
+    if (typeof Headers !== 'undefined' && h instanceof Headers) h.forEach((v, k) => { out[String(k).toLowerCase()] = v; });
+    else if (Array.isArray(h)) h.forEach(p2 => { out[String(p2[0]).toLowerCase()] = String(p2[1]); });
+    else if (typeof h === 'object') for (const k of Object.keys(h)) out[k.toLowerCase()] = String(h[k]);
+  } catch (e) {}
+}
+const HDR_DENY = /^(host|content-length|cookie|origin|referer|accept-encoding|connection|user-agent)$/i;
+function cleanHeaders(h) {
+  const out = {};
+  for (const k of Object.keys(h || {})) if (!HDR_DENY.test(k)) out[k] = h[k];
+  return out;
+}
+
+const Tracker = {
+  register(o) {
+    const id = (o.id != null) ? String(o.id) : 'local-' + (++S.seq);
+    const existing = S.trades.get(id);
+    if (existing) return existing;
+    const openedAt = o.openedAt || Date.now();
+    const expirySec = Number(o.expirySec) || CONFIG.expirySec;
+    const T = {
+      id, asset: o.asset || '?', dir: o.dir || '?', amount: round2(o.amount || 0),
+      level: o.level || guessLevelByStake(o.amount),
+      _levelGuessed: !o.level,
+      openedAt, expiresAt: o.expiresAt || (openedAt + expirySec * 1000),
+      balanceBefore: S.balance,
+      status: 'OPEN', result: null, profit: null, method: null,
+      retries: 0, via: o.via || 'external'
+    };
+    S.trades.set(id, T);
+    log('info', 'TRACK ' + T.level + ' ' + T.dir + ' ' + T.asset + ' ' + fmt(T.amount) + '  id=' + T.id + '  (via ' + T.via + ')');
+    return T;
+  },
+
+  /* orders/opened style frame: refine or register an open trade */
+  registerOpen(obj) {
+    try {
+      const id = extractId(obj);
+      if (id == null) return;
+      const key = String(id);
+      const existing = S.trades.get(key);
+      const expEpoch = (typeof obj.time === 'number' && obj.time > Date.now() / 1000) ? obj.time * 1000
+        : (typeof obj.open_time === 'number' && obj.open_time > Date.now() / 1000) ? obj.open_time * 1000 : null;
+      const amt = obj.amount != null ? Number(obj.amount) : (obj.invest != null ? Number(obj.invest) : null);
+      if (existing) {
+        if (expEpoch && existing.status === 'OPEN') existing.expiresAt = expEpoch;
+        if (typeof obj.asset === 'string' && existing.status === 'OPEN') existing.asset = obj.asset;
+        if (amt != null && existing.status === 'OPEN' && amt > 0) {
+          existing.amount = round2(amt);
+          if (existing._levelGuessed) existing.level = guessLevelByStake(existing.amount);
+        }
+        return;
+      }
+      if (!expEpoch && !S.trades.size) return; // old history junk before any live trade
+      this.register({
+        id, asset: typeof obj.asset === 'string' ? obj.asset : '?',
+        amount: amt || 0, dir: normalizeDir(obj.action),
+        expirySec: expEpoch ? Math.max(5, Math.round((expEpoch - Date.now()) / 1000)) : CONFIG.expirySec,
+        expiresAt: expEpoch || undefined,
+        openedAt: Date.now(), via: 'external'
+      });
+    } catch (e) {}
+  },
+
+  onResultCandidate(obj) {
+    try {
+      const id = extractId(obj);
+      if (id == null) return;
+      let profit = null;
+      for (const k of Object.keys(obj)) if (PROFIT_KEY.test(k) && typeof obj[k] === 'number') { profit = obj[k]; break; }
+      if (profit == null) return;
+      S.pendingResults.set(String(id), { profit, at: Date.now() });
+      if (S.pendingResults.size > 500) S.pendingResults.clear();
+      const T = S.trades.get(String(id));
+      if (T && T.status === 'OPEN' && Date.now() >= T.expiresAt + CONFIG.settleGraceMs) {
+        S.pendingResults.delete(String(id));
+        this.settle(T, profit, 'result-frame');
+      }
+    } catch (e) {}
+  },
+
+  settle(T, profit, method) {
+    if (T.status === 'SETTLED') return;
+    T.status = 'SETTLED'; T.profit = round2(profit); T.method = method;
+    T.result = T.profit > 0 ? 'WIN' : T.profit < 0 ? 'LOSE' : 'DRAW';
+    const st = S.stats[T.level] || S.stats.UNKNOWN;
+    if (T.result === 'WIN') st.w++; else if (T.result === 'LOSE') st.l++; else st.d++;
+    st.pnl = round2(st.pnl + T.profit);
+    S.todayPnl = round2(S.todayPnl + T.profit);
+    log(T.result === 'WIN' ? 'info' : 'warn',
+      'RESULT ' + T.level + ' ' + T.result + ' ' + fmt(T.profit) + '  ' + T.asset + '  id=' + T.id + '  [' + method + ']' +
+      '   |  BASE ' + S.stats.BASE.w + 'W/' + S.stats.BASE.l + 'L  MTG1 ' + S.stats.MTG1.w + 'W/' + S.stats.MTG1.l + 'L  MTG2 ' + S.stats.MTG2.w + 'W/' + S.stats.MTG2.l + 'L');
+    Martingale.onSettled(T);
+  },
+
+  settleUnknown(T) {
+    if (T.status === 'SETTLED') return;
+    T.status = 'SETTLED'; T.result = 'UNKNOWN'; T.profit = null; T.method = 'timeout';
+    S.stats.UNKNOWN.d++;
+    log('warn', 'Result UNKNOWN for id=' + T.id + ' - NOT counted as win/lose (check Deals panel or BOT.pullHistory()).');
+    Martingale.onSettled(T);
+  },
+
+  /* Balance-delta fallback: ONLY valid when no other open trade overlaps
+     this trade's window. This is what fixes the "same time open trade"
+     wrong-result bug: overlapping trades are NEVER resolved by balance. */
+  tryIsolatedBalance(T) {
+    if (S.balance == null || T.balanceBefore == null) return false;
+    if (S.lastBalanceAt < T.expiresAt + CONFIG.settleGraceMs) return false;
+    for (const O of S.trades.values()) {
+      if (O === T || O.status !== 'OPEN') continue;
+      const overlap = (O.openedAt - 5000) < (T.expiresAt + CONFIG.settleGraceMs) &&
+                      (O.expiresAt + CONFIG.settleGraceMs) > (T.openedAt - 5000);
+      if (overlap) return false;
+    }
+    this.settle(T, S.balance - T.balanceBefore, 'balance-isolated');
+    return true;
+  },
+
+  loop() {
+    const now = Date.now();
+    let stuck = false;
+    for (const T of S.trades.values()) {
+      if (T.status !== 'OPEN') continue;
+      if (now < T.expiresAt + CONFIG.settleGraceMs) continue;
+      const p = S.pendingResults.get(T.id);
+      if (p && p.at >= T.expiresAt + CONFIG.settleGraceMs - 1500) {
+        S.pendingResults.delete(T.id);
+        this.settle(T, p.profit, 'result-frame');
+        continue;
+      }
+      if (this.tryIsolatedBalance(T)) continue;
+      T.retries++;
+      stuck = true;
+      if (T.retries === 5 || T.retries === 15 || T.retries === 30) Bridge.pullHistory();
+      if (T.retries > CONFIG.unknownAfterRetries) this.settleUnknown(T);
+    }
+    if (stuck && now - (this._lastPull || 0) > 10000) { this._lastPull = now; Bridge.pullHistory(); }
+  }
+};
+
+/* ========================= MARTINGALE (MTG1 / MTG2) ===================== */
+const Martingale = {
+  stakeFor(level, base) {
+    if (level === 'MTG1') return round2(base * CONFIG.mtg.multi1);
+    if (level === 'MTG2') return round2(base * CONFIG.mtg.multi2);
+    return round2(base);
+  },
+  onSettled(T) {
+    if (!T || T.level === 'EXT' || T.level === 'UNKNOWN') return;
+    if (!CONFIG.mtg.enabled) { S.nextLevel = 'BASE'; return; }
+    if (T.result === 'WIN') {
+      S.nextLevel = 'BASE'; S.cycleBaseStake = CONFIG.stake;
+      log('info', 'Win - cycle reset. Next: BASE ' + fmt(CONFIG.stake));
+    } else if (T.result === 'LOSE') {
+      if (T.level === 'BASE') {
+        S.nextLevel = 'MTG1';
+        log('warn', 'Loss - next: MTG1 ' + fmt(this.stakeFor('MTG1', S.cycleBaseStake)));
+      } else if (T.level === 'MTG1') {
+        S.nextLevel = 'MTG2';
+        log('warn', 'Loss - next: MTG2 ' + fmt(this.stakeFor('MTG2', S.cycleBaseStake)));
+      } else {
+        S.nextLevel = 'BASE'; S.cycleBaseStake = CONFIG.stake;
+        log('warn', 'MTG2 lost - cycle reset. Next: BASE ' + fmt(CONFIG.stake));
+      }
+    } else {
+      S.nextLevel = (CONFIG.mtg.onDraw === 'reset') ? 'BASE' : T.level;
+    }
+  }
+};
+
+/* ========================= OTC SIGNAL ENGINE ============================
+ * Mean-reversion for OTC feeds: RSI(14) pullback inside EMA(9/21) trend.
+ * Uses the page's own candles API (learned from chart traffic).
+ * ======================================================================== */
+const Signals = {
+  _warnAt: 0,
+  async getCandles(asset) {
+    const t = S.templates.CANDLES;
+    if (!t) return null;
+    try {
+      const body = t.body ? Object.assign({}, t.body) : {};
+      if (body.asset != null) body.asset = asset;
+      let url = t.url;
+      if (body.asset == null && /asset=/.test(url)) url = url.replace(/asset=[^&]*/, 'asset=' + encodeURIComponent(asset));
+      const res = await Bridge.raw(url, { method: t.method || 'POST', headers: t.headers, body: t.body ? JSON.stringify(body) : undefined });
+      const data = JSON.parse(await res.text());
+      const arr = this.findCandleArray(data);
+      if (!arr || arr.length < 30) return null;
+      return this.normalize(arr);
+    } catch (e) { return null; }
+  },
+  findCandleArray(data) {
+    let best = null;
+    (function walk(n, d) {
+      if (d > 6 || n == null || typeof n !== 'object') return;
+      if (Array.isArray(n)) {
+        if (n.length > 10 && Signals.isCandle(n[0]) && (!best || n.length > best.length)) best = n;
+        for (const it of n) walk(it, d + 1);
+        return;
+      }
+      for (const k of Object.keys(n)) walk(n[k], d + 1);
+    })(data, 0);
+    return best;
+  },
+  isCandle(x) {
+    if (Array.isArray(x)) return x.length >= 5 && typeof x[0] === 'number' && typeof x[1] === 'number';
+    return !!(x && typeof x === 'object' && typeof x.close === 'number' && (typeof x.time === 'number' || typeof x.open === 'number'));
+  },
+  normalize(arr) {
+    // objects: {time,open,close,high,low} | arrays: [time,open,close,high,low]
+    return arr.filter(this.isCandle.bind(this)).map(x => Array.isArray(x)
+      ? { time: x[0], open: x[1], close: x[2], high: x[3], low: x[4] }
+      : { time: x.time, open: x.open, close: x.close, high: (x.high != null ? x.high : x.max), low: (x.low != null ? x.low : x.min) });
+  },
+  async get(asset) {
+    const candles = await this.getCandles(asset);
+    if (!candles || candles.length < 40) {
+      if (Date.now() - this._warnAt > 20000) { this._warnAt = Date.now(); log('warn', 'No candles API learned yet - open the OTC chart once. Signals idle (tracking still works).'); }
+      return null;
+    }
+    const closes = candles.map(c => c.close).filter(v => typeof v === 'number');
+    if (closes.length < 40) return null;
+    const rsi = this.rsi(closes, CONFIG.signal.rsiLen);
+    const ef = this.ema(closes, CONFIG.signal.emaFast);
+    const es = this.ema(closes, CONFIG.signal.emaSlow);
+    if (ef > es && rsi <= CONFIG.signal.rsiLow) return 'CALL';
+    if (es > ef && rsi >= CONFIG.signal.rsiHigh) return 'PUT';
+    return null;
+  },
+  ema(arr, n) { const k = 2 / (n + 1); let e = arr[0]; for (let i = 1; i < arr.length; i++) e = arr[i] * k + e * (1 - k); return e; },
+  rsi(arr, n) {
+    if (arr.length < n + 1) return 50;
+    let g = 0, l = 0;
+    for (let i = arr.length - n; i < arr.length; i++) { const d = arr[i] - arr[i - 1]; if (d >= 0) g += d; else l -= d; }
+    if (l === 0) return 100;
+    return 100 - 100 / (1 + g / l);
+  }
+};
+
+/* ============================ TRADE ENGINE ============================== */
+const Engine = {
+  _timer: null,
+  start() {
+    if (S.running) return;
+    if (!S.templates.BUY) { log('warn', 'Cannot start: order API not learned yet. Make ONE manual demo trade first (bot learns from it).'); return; }
+    if (CONFIG.onlyDemo && !S.demoConfirmed) { log('warn', 'Cannot start: DEMO not confirmed. Switch to the demo account or run BOT.confirmDemo().'); return; }
+    S.running = true;
+    this._timer = setInterval(() => this.tradeLoop(), 3000);
+    log('info', 'ENGINE STARTED - assets: ' + CONFIG.assets.join(', ') + ' | stake ' + fmt(CONFIG.stake) +
+                ' | MTG x' + CONFIG.mtg.multi1 + '/x' + CONFIG.mtg.multi2 + ' | expiry ' + CONFIG.expirySec + 's');
+  },
+  stop() { S.running = false; if (this._timer) clearInterval(this._timer); this._timer = null; log('info', 'ENGINE STOPPED (tracking continues).'); },
+
+  guard() {
+    const open = [...S.trades.values()].filter(T => T.status === 'OPEN').length;
+    if (open >= CONFIG.maxConcurrent) return false;
+    if (CONFIG.dailyLossStop && S.todayPnl <= -CONFIG.dailyLossStop) { log('warn', 'Daily loss stop hit (' + fmt(S.todayPnl) + ') - engine stopped.'); this.stop(); return false; }
+    if (CONFIG.dailyProfitGoal && S.todayPnl >= CONFIG.dailyProfitGoal) { log('info', 'Profit goal reached (' + fmt(S.todayPnl) + ') - engine stopped.'); this.stop(); return false; }
+    return true;
+  },
+
+  pickAsset() {
+    const openAssets = new Set([...S.trades.values()].filter(T => T.status === 'OPEN').map(T => T.asset));
+    const list = CONFIG.assets.filter(a => !CONFIG.onlyOtc || /otc/i.test(a));
+    if (!list.length) { warnOnce('noOtc', 'No OTC asset in CONFIG.assets - add e.g. "EURUSD_otc".'); return null; }
+    let best = null, bestAt = Infinity;
+    for (const a of list) {
+      if (openAssets.has(a)) continue;
+      const at = S.lastTradeAtByAsset.get(a) || 0;
+      if (at < bestAt) { bestAt = at; best = a; }
+    }
+    return best;
+  },
+
+  async tradeLoop() {
+    try {
+      if (!S.running || !this.guard()) return;
+      const asset = this.pickAsset();
+      if (!asset) return;
+      if (Date.now() - (S.lastTradeAtByAsset.get(asset) || 0) < CONFIG.signal.cooldownSec * 1000) return;
+      const level = S.nextLevel;
+      const sig = await Signals.get(asset);
+      if (!sig) return;
+      if (level === 'BASE' || !CONFIG.mtg.enabled || level === 'EXT') {
+        Bridge.buy(asset, round2(S.cycleBaseStake), sig, CONFIG.expirySec, 'BASE');
+      } else {
+        Bridge.buy(asset, Martingale.stakeFor(level, S.cycleBaseStake), sig, CONFIG.expirySec, level);
+      }
+      S.lastTradeAtByAsset.set(asset, Date.now());
+    } catch (e) { log('error', 'tradeLoop: ' + (e && e.message ? e.message : e)); }
+  }
+};
+
+/* ================================ HUD =================================== */
+const CSS = `
+#qxbot-hud{position:fixed;top:64px;right:10px;width:312px;z-index:2147483000;background:rgba(13,18,28,.94);color:#dfe6ee;font:12px/1.45 -apple-system,'Segoe UI',Roboto,Arial,sans-serif;border:1px solid #2a3550;border-radius:12px;box-shadow:0 8px 30px rgba(0,0,0,.45);user-select:none}
+#qxb-head{display:flex;align-items:center;gap:8px;padding:9px 12px;cursor:move;font-weight:700;letter-spacing:.4px;border-bottom:1px solid #232d45}
+.qxb-dot{width:8px;height:8px;border-radius:50%;background:#64748b}
+.qxb-dot.on{background:#22c55e;box-shadow:0 0 6px #22c55e}
+.qxb-dot.off{background:#ef4444;box-shadow:0 0 6px #ef4444}
+#qxb-state{font-weight:600;color:#8fa3c8;font-size:10px}
+#qxb-btn{background:#6c5ce7;color:#fff;border:0;border-radius:6px;padding:4px 10px;font-weight:700;cursor:pointer}
+#qxb-btn.stop{background:#ef4444}
+#qxb-x{background:transparent;color:#8fa3c8;border:0;font-size:14px;cursor:pointer;padding:0 4px}
+#qxb-body{padding:10px 12px 12px}
+#qxb-bal{margin-bottom:8px;color:#aab8d0}
+#qxb-bal b{color:#e2e8f0}
+.qxb-demo{color:#22c55e;font-weight:700}
+.qxb-real{color:#ef4444;font-weight:700}
+#qxb-open{margin-bottom:8px;display:flex;flex-direction:column;gap:4px}
+.qxb-openrow{display:flex;gap:8px;align-items:center;background:#161d2e;border-radius:8px;padding:5px 8px}
+.qxb-lvl{font-size:10px;font-weight:800;padding:1px 6px;border-radius:5px;background:#334155;color:#cbd5e1}
+.qxb-lvl.BASE{background:#1d4ed8;color:#dbeafe}
+.qxb-lvl.MTG1{background:#b45309;color:#fef3c7}
+.qxb-lvl.MTG2{background:#b91c1c;color:#fee2e2}
+.qxb-call{color:#22c55e;font-weight:700}
+.qxb-put{color:#ef4444;font-weight:700}
+#qxb-stats{width:100%;border-collapse:collapse;margin-bottom:8px}
+#qxb-stats th{color:#7d8db0;font-weight:600;text-align:right;padding:2px 4px;font-size:10px;text-transform:uppercase}
+#qxb-stats td{padding:3px 4px;text-align:right;border-top:1px solid #1e2740}
+#qxb-stats td:first-child{text-align:left;font-weight:700}
+.qxb-win{color:#22c55e;font-weight:700}
+.qxb-lose{color:#ef4444;font-weight:700}
+.qxb-draw{color:#94a3b8}
+#qxb-recent{display:flex;flex-wrap:wrap;gap:4px;margin-bottom:6px;min-height:18px}
+.qxb-chip{width:22px;height:18px;border-radius:5px;font-size:9px;font-weight:800;display:flex;align-items:center;justify-content:center}
+.qxb-chip.WIN{background:#14532d;color:#bbf7d0}
+.qxb-chip.LOSE{background:#7f1d1d;color:#fecaca}
+.qxb-chip.DRAW{background:#334155;color:#cbd5e1}
+.qxb-chip.UNKNOWN{background:#78350f;color:#fde68a}
+#qxb-hint{color:#5f7099;font-size:10px}
+#qxbot-hud.qxb-min #qxb-body{display:none}`;
+
+const HUD = {
+  root: null, built: false,
+  build() {
+    if (this.built || !document.body) return;
+    this.built = true;
+    const st = document.createElement('style');
+    st.textContent = CSS;
+    document.head.appendChild(st);
+    const root = document.createElement('div');
+    root.id = 'qxbot-hud';
+    root.innerHTML = '<div id="qxb-head"><span class="qxb-dot" id="qxb-dot"></span><span>QX&nbsp;BOT</span>' +
+      '<span id="qxb-state">LEARNING</span><span style="flex:1"></span>' +
+      '<button id="qxb-btn">START</button><button id="qxb-x" title="minimize">-</button></div>' +
+      '<div id="qxb-body"><div id="qxb-bal">Balance: -</div><div id="qxb-open"></div>' +
+      '<table id="qxb-stats"></table><div id="qxb-recent"></div>' +
+      '<div id="qxb-hint">BOT.help() - Alt+B hide - drag header to move</div></div>';
+    document.body.appendChild(root);
+    this.root = root;
+    root.querySelector('#qxb-btn').addEventListener('click', () => { try { S.running ? Engine.stop() : Engine.start(); } catch (e) { log('error', e.message); } });
+    root.querySelector('#qxb-x').addEventListener('click', () => root.classList.toggle('qxb-min'));
+    const head = root.querySelector('#qxb-head');
+    head.addEventListener('mousedown', ev => {
+      if (ev.target.tagName === 'BUTTON') return;
+      const r = root.getBoundingClientRect();
+      const ox = ev.clientX - r.left, oy = ev.clientY - r.top;
+      const mv = e => { root.style.left = (e.clientX - ox) + 'px'; root.style.top = (e.clientY - oy) + 'px'; root.style.right = 'auto'; };
+      const up = () => { document.removeEventListener('mousemove', mv); document.removeEventListener('mouseup', up); };
+      document.addEventListener('mousemove', mv); document.addEventListener('mouseup', up);
+      ev.preventDefault();
+    });
+    document.addEventListener('keydown', ev => { if (ev.altKey && (ev.key === 'b' || ev.key === 'B')) root.classList.toggle('qxb-min'); });
+    setInterval(() => { try { this.render(); } catch (e) {} }, 500);
+  },
+  render() {
+    if (!this.root) return;
+    const r = this.root;
+    const dot = r.querySelector('#qxb-dot'), state = r.querySelector('#qxb-state'), btn = r.querySelector('#qxb-btn');
+    const ready = !!S.templates.BUY;
+    if (S.running) { dot.className = 'qxb-dot on'; state.textContent = 'RUNNING'; btn.textContent = 'STOP'; btn.classList.add('stop'); }
+    else { dot.className = 'qxb-dot ' + (ready ? 'on' : 'off'); state.textContent = ready ? 'READY' : 'LEARNING - make 1 demo trade'; btn.textContent = 'START'; btn.classList.remove('stop'); }
+    r.querySelector('#qxb-bal').innerHTML = 'Balance: ' + (S.balance != null ? '<b>' + fmt(S.balance) + '</b>' : '-') +
+      (S.balanceIsDemo != null ? ' <span class="' + (S.balanceIsDemo ? 'qxb-demo' : 'qxb-real') + '">' + (S.balanceIsDemo ? 'DEMO' : 'REAL') + '</span>' : '') +
+      '<span style="float:right">Session P&amp;L: <b class="' + (S.todayPnl > 0 ? 'qxb-win' : S.todayPnl < 0 ? 'qxb-lose' : '') + '">' + fmt(S.todayPnl) + '</b></span>';
+    const open = [...S.trades.values()].filter(T => T.status === 'OPEN').sort((a, b) => a.expiresAt - b.expiresAt);
+    let openHtml = open.map(T => {
+      const left = Math.max(0, Math.ceil((T.expiresAt - Date.now()) / 1000));
+      return '<div class="qxb-openrow"><span class="qxb-lvl ' + T.level + '">' + T.level + '</span>' +
+        '<span>' + String(T.asset).replace(/_otc/i, ' OTC') + '</span>' +
+        '<span class="' + (T.dir === 'CALL' ? 'qxb-call' : 'qxb-put') + '">' + T.dir + '</span>' +
+        '<b>' + fmt(T.amount) + '</b><span style="flex:1"></span><span>' + left + 's</span></div>';
+    }).join('');
+    if (!openHtml) {
+      openHtml = '<div style="color:#5f7099">No open trades' +
+        (S.nextLevel !== 'BASE' ? ' - next: <b>' + S.nextLevel + '</b> ' + fmt(Martingale.stakeFor(S.nextLevel, S.cycleBaseStake)) : '') + '</div>';
+    }
+    r.querySelector('#qxb-open').innerHTML = openHtml;
+    let W = 0, L = 0, D = 0, P = 0;
+    const row = (name, s) => {
+      W += s.w; L += s.l; D += s.d; P = round2(P + s.pnl);
+      const wr = (s.w + s.l) ? Math.round(100 * s.w / (s.w + s.l)) + '%' : '-';
+      const pc = s.pnl > 0 ? 'qxb-win' : s.pnl < 0 ? 'qxb-lose' : '';
+      return '<tr><td>' + name + '</td><td class="qxb-win">' + s.w + '</td><td class="qxb-lose">' + s.l + '</td>' +
+        '<td class="qxb-draw">' + s.d + '</td><td class="' + pc + '">' + fmt(s.pnl) + '</td><td>' + wr + '</td></tr>';
+    };
+    let tbl = '<tr><th>Lvl</th><th>W</th><th>L</th><th>D</th><th>P&amp;L</th><th>Win%</th></tr>';
+    tbl += row('BASE', S.stats.BASE) + row('MTG1', S.stats.MTG1) + row('MTG2', S.stats.MTG2);
+    if (S.stats.EXT.w + S.stats.EXT.l + S.stats.EXT.d > 0) tbl += row('EXT', S.stats.EXT);
+    if (S.stats.UNKNOWN.d > 0) tbl += row('UNK', S.stats.UNKNOWN);
+    const pc = P > 0 ? 'qxb-win' : P < 0 ? 'qxb-lose' : '';
+    const wrT = (W + L) ? Math.round(100 * W / (W + L)) + '%' : '-';
+    tbl += '<tr><td>TOTAL</td><td class="qxb-win">' + W + '</td><td class="qxb-lose">' + L + '</td><td class="qxb-draw">' + D + '</td><td class="' + pc + '">' + fmt(P) + '</td><td>' + wrT + '</td></tr>';
+    r.querySelector('#qxb-stats').innerHTML = tbl;
+    const recent = [...S.trades.values()].filter(T => T.status === 'SETTLED').slice(-12);
+    r.querySelector('#qxb-recent').innerHTML = recent.map(T =>
+      '<span class="qxb-chip ' + T.result + '" title="' + T.level + ' ' + T.asset + ' ' + fmt(T.profit == null ? 0 : T.profit) + '">' +
+      (T.result === 'WIN' ? 'W' : T.result === 'LOSE' ? 'L' : T.result === 'DRAW' ? 'D' : '?') + '</span>').join('');
+  }
+};
+
+/* ============================ SELF-TEST =================================
+ * Proves the win/lose checker is correct for the exact bugs reported:
+ * simultaneous trades, no double counting, no balance guessing on overlap.
+ * ======================================================================== */
+const SelfTest = {
+  run() {
+    const snap = {
+      trades: S.trades, pending: new Map(S.pendingResults),
+      stats: JSON.parse(JSON.stringify(S.stats)), todayPnl: S.todayPnl,
+      balance: S.balance, lastBalanceAt: S.lastBalanceAt,
+      nextLevel: S.nextLevel, cycle: S.cycleBaseStake, grace: CONFIG.settleGraceMs
+    };
+    const out = [];
+    const t0 = Date.now();
+    const check = (name, cond, info) => out.push({ test: name, pass: !!cond, info: info || '' });
+    try {
+      CONFIG.settleGraceMs = 0;
+
+      /* T1 + T2: two trades open at the SAME time - results must not mix */
+      S.trades = new Map(); S.stats = emptyStats(); S.todayPnl = 0; S.nextLevel = 'BASE';
+      const A = Tracker.register({ id: 'TEST-A', asset: 'EURUSD_otc', dir: 'CALL', amount: 1, expirySec: 60, level: 'BASE', openedAt: t0 - 2000, via: 'test' });
+      const B = Tracker.register({ id: 'TEST-B', asset: 'EURUSD_otc', dir: 'PUT', amount: 2.2, expirySec: 60, level: 'MTG1', openedAt: t0 - 1900, via: 'test' });
+      A.expiresAt = t0 - 1000; B.expiresAt = t0 - 1000;
+      S.pendingResults.set('TEST-A', { profit: -1, at: t0 });
+      S.pendingResults.set('TEST-B', { profit: 4.4, at: t0 });
+      Tracker.loop();
+      check('T1 simultaneous trades each get OWN result',
+        S.stats.BASE.l === 1 && S.stats.MTG1.w === 1 && round2(S.todayPnl) === 3.4 && S.nextLevel === 'BASE',
+        'BASE 1L / MTG1 1W, session ' + fmt(S.todayPnl));
+      Tracker.loop(); Tracker.loop();
+      check('T2 no double counting after re-checks', S.stats.BASE.l === 1 && S.stats.MTG1.w === 1);
+
+      /* T3: overlapping trades with NO result data - never guessed */
+      S.trades = new Map(); S.stats = emptyStats(); S.todayPnl = 0; S.pendingResults.clear();
+      const C = Tracker.register({ id: 'TEST-C', asset: 'X_otc', dir: 'CALL', amount: 1, expirySec: 60, level: 'BASE', openedAt: t0 - 2000, via: 'test' });
+      const D = Tracker.register({ id: 'TEST-D', asset: 'X_otc', dir: 'PUT', amount: 1, expirySec: 60, level: 'BASE', openedAt: t0 - 1900, via: 'test' });
+      C.expiresAt = t0 - 1000; D.expiresAt = t0 - 1000;
+      C.balanceBefore = D.balanceBefore = 1000;
+      S.balance = 1001.9; S.lastBalanceAt = t0 + 3000;
+      Tracker.loop();
+      check('T3 overlapping + no data -> stays OPEN (no false W/L)',
+        C.status === 'OPEN' && D.status === 'OPEN' && C.result == null && D.result == null);
+
+      /* T4: single (non-overlapping) trade - balance delta resolves safely */
+      S.trades.delete('TEST-D');
+      Tracker.loop();
+      check('T4 isolated trade -> correct balance-delta result',
+        C.status === 'SETTLED' && C.result === 'WIN' && Math.abs(C.profit - 1.9) < 0.001,
+        'resolved WIN +$1.90 via balance-isolated');
+
+      /* T5: MTG chain BASE lose -> MTG1, MTG1 win -> BASE */
+      S.trades = new Map(); S.stats = emptyStats(); S.nextLevel = 'BASE'; S.cycleBaseStake = CONFIG.stake;
+      const E = Tracker.register({ id: 'TEST-E', asset: 'X_otc', dir: 'CALL', amount: 1, expirySec: 60, level: 'BASE', openedAt: t0, via: 'test' });
+      E.status = 'SETTLED'; E.result = 'LOSE'; E.profit = -1; Martingale.onSettled(E);
+      const step1 = S.nextLevel === 'MTG1';
+      const F = Tracker.register({ id: 'TEST-F', asset: 'X_otc', dir: 'CALL', amount: 2.2, expirySec: 60, level: 'MTG1', openedAt: t0, via: 'test' });
+      F.status = 'SETTLED'; F.result = 'WIN'; F.profit = 1.2; Martingale.onSettled(F);
+      check('T5 MTG chain: BASE lose -> MTG1, win -> BASE', step1 && S.nextLevel === 'BASE');
+    } catch (e) {
+      check('exception during self-test', false, String(e));
+    } finally {
+      S.trades = snap.trades; S.pendingResults = snap.pending; S.stats = snap.stats;
+      S.todayPnl = snap.todayPnl; S.balance = snap.balance; S.lastBalanceAt = snap.lastBalanceAt;
+      S.nextLevel = snap.nextLevel; S.cycleBaseStake = snap.cycle; CONFIG.settleGraceMs = snap.grace;
+    }
+    const pass = out.every(o => o.pass);
+    console.log('%c QXBOT SELF-TEST: ' + (pass ? 'ALL PASSED (' + out.length + ')' : 'FAILURES!') + ' ',
+      pass ? 'background:#166534;color:#fff;font-weight:700;border-radius:3px;padding:1px 6px'
+           : 'background:#b91c1c;color:#fff;font-weight:700;border-radius:3px;padding:1px 6px');
+    console.table(out);
+    return { pass, results: out };
+  }
+};
+
+/* ============================ CONSOLE API =============================== */
+window.BOT = {
+  help() {
+    console.table([
+      ['BOT.selfTest()', 'run 5 correctness tests of the win/lose checker (do this first)'],
+      ['BOT.start()', 'start the auto-trading engine (needs 1 manual demo trade first)'],
+      ['BOT.stop()', 'stop the engine (win/lose tracking keeps running)'],
+      ['BOT.stats()', 'print win/lose stats table: BASE / MTG1 / MTG2'],
+      ['BOT.trades()', 'list every tracked trade with its result'],
+      ['BOT.setStake(1)', 'set BASE stake'],
+      ['BOT.setExpiry(60)', 'set expiry seconds'],
+      ['BOT.setAssets(["EURUSD_otc","GBPUSD_otc"])', 'set the OTC assets to trade'],
+      ['BOT.setSchedule(1, 2.2, 4.8)', 'set stake + MTG1/MTG2 multipliers (also fixes auto-tagging of YOUR bot trades)'],
+      ['BOT.tagLevel("123456","MTG1")', 'manually tag a trade id as BASE/MTG1/MTG2'],
+      ['BOT.pullHistory()', 'force-poll the deals history API'],
+      ['BOT.confirmDemo()', 'confirm this is the DEMO account (if auto-detect fails)'],
+      ['BOT.allowReal(false)', 'keep DEMO-only lock (default). true = enable real trading'],
+      ['BOT.reset()', 'clear all stats and tracked trades'],
+      ['BOT.debug(30)', 'show last captured network frames (debugging)'],
+      ['BOT.status()', 'current engine state']
+    ], ['command', 'description']);
+    return 'QXBOT v2.0';
+  },
+  selfTest() { return SelfTest.run(); },
+  start() { Engine.start(); },
+  stop() { Engine.stop(); },
+  stats() {
+    const rows = ['BASE', 'MTG1', 'MTG2', 'EXT', 'UNKNOWN'].map(k => ({
+      level: k, win: S.stats[k].w, lose: S.stats[k].l, draw: S.stats[k].d,
+      pnl: S.stats[k].pnl,
+      winRate: (S.stats[k].w + S.stats[k].l) ? Math.round(100 * S.stats[k].w / (S.stats[k].w + S.stats[k].l)) + '%' : '-'
+    }));
+    rows.push({
+      level: 'TOTAL', win: rows.reduce((a, r) => a + r.win, 0), lose: rows.reduce((a, r) => a + r.lose, 0),
+      draw: rows.reduce((a, r) => a + r.draw, 0), pnl: round2(rows.reduce((a, r) => a + r.pnl, 0)), winRate: '-'
+    });
+    console.table(rows);
+    return rows;
+  },
+  trades() {
+    const rows = [...S.trades.values()].map(T => ({
+      id: T.id, level: T.level, asset: T.asset, dir: T.dir, amount: T.amount,
+      status: T.status, result: T.result || '-', profit: T.profit,
+      opened: new Date(T.openedAt).toLocaleTimeString(), expires: new Date(T.expiresAt).toLocaleTimeString(),
+      settledBy: T.method || '-'
+    }));
+    console.table(rows);
+    return rows;
+  },
+  setStake(v) { CONFIG.stake = round2(v); log('info', 'BASE stake = ' + fmt(CONFIG.stake)); },
+  setExpiry(sec) { CONFIG.expirySec = Number(sec) || 60; log('info', 'expiry = ' + CONFIG.expirySec + 's'); },
+  setAssets(arr) { CONFIG.assets = (arr || []).map(String); log('info', 'assets = ' + CONFIG.assets.join(', ')); },
+  setSchedule(base, m1, m2) {
+    CONFIG.stake = round2(base); CONFIG.mtg.multi1 = Number(m1); CONFIG.mtg.multi2 = Number(m2);
+    log('info', 'schedule: BASE ' + fmt(CONFIG.stake) + ' -> MTG1 ' + fmt(Martingale.stakeFor('MTG1', CONFIG.stake)) +
+                ' -> MTG2 ' + fmt(Martingale.stakeFor('MTG2', CONFIG.stake)));
+  },
+  tagLevel(id, level) {
+    const T = S.trades.get(String(id));
+    if (T) { T.level = String(level).toUpperCase(); log('info', 'id=' + id + ' tagged ' + T.level); }
+    else log('warn', 'trade id not found');
+  },
+  pullHistory() { Bridge.pullHistory(true); },
+  confirmDemo() { S.demoConfirmed = true; log('info', 'DEMO confirmed by user.'); },
+  allowReal(v) { CONFIG.onlyDemo = !v; log(v ? 'warn' : 'info', v ? 'REAL trading enabled - be careful!' : 'DEMO-only lock active.'); },
+  reset() { S.trades.clear(); S.stats = emptyStats(); S.todayPnl = 0; S.nextLevel = 'BASE'; S.cycleBaseStake = CONFIG.stake; log('info', 'stats cleared.'); },
+  debug(n) { return S.debugRing.slice(-(Number(n) || 30)); },
+  status() {
+    return {
+      running: S.running, orderApiLearned: !!S.templates.BUY, demoConfirmed: S.demoConfirmed,
+      balance: S.balance, balanceIsDemo: S.balanceIsDemo, learnedTemplates: Object.keys(S.templates),
+      nextLevel: S.nextLevel, openTrades: [...S.trades.values()].filter(T => T.status === 'OPEN').length,
+      trackedTrades: S.trades.size, liveSockets: S.sockets.size, sessionPnl: S.todayPnl
+    };
+  }
+};
+
+/* ================================ BOOT ================================== */
+function boot() {
+  Bridge.install();
+  if (document.body) { try { HUD.build(); } catch (e) {} } else { setTimeout(() => { try { HUD.build(); } catch (e) {} }, 1500); }
+  setInterval(() => { try { Tracker.loop(); } catch (e) {} }, CONFIG.pollMs);
+  setInterval(() => { try { Bridge.probeBalance(); } catch (e) {} }, 15000);
+  window.__QXBOT__ = '2.0';
+  log('info', 'v2.0 loaded - concurrent-safe win/lose tracker + MTG1/MTG2 stats.');
+  log('info', 'NEXT: wait 2-3s, then run BOT.selfTest(). Make ONE manual demo trade so the bot learns the order API, then BOT.start() or keep your own bot (its trades are auto-tracked).');
+}
+boot();
+})();
